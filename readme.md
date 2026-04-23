@@ -86,4 +86,6 @@ Traces are saved to ./traces/ and a summary JSON to ./metrics/tension_results.js
 }
 ```
 
+### Acknowledgments
 
+Special thanks to the reverse engineering community and former colleagues (especially those from the Fyyre era) who helped shape the low-level thinking behind Noesis Tension.
