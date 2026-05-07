@@ -1,6 +1,9 @@
 """
-- Noesis Tension Classifier — v0.3.2
-- Author: James (noct-ml)
+- Noesis Tension Classifier — v3.0-stable
+- RAP completely removed
+- Prompt classes reduced to A (factual) / B (everything else)
+- Immediate trace writing + aggressive per-prompt cleanup
+- Telemetry-only, stable across Instruct and base models
 """
 
 import os
@@ -9,7 +12,6 @@ import math
 import json
 import hashlib
 import statistics
-import types
 from collections import deque
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
@@ -24,7 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 #  Config
 # -----------------------------
 
-NOESIS_VERSION = "0.3.2"
+NOESIS_VERSION = "0.3.0"
 
 NOESIS_BASELINE_ID = os.environ.get("NOESIS_BASELINE_ID")
 
@@ -41,9 +43,7 @@ NOESIS_MODEL_NAME = os.environ.get(
 NOESIS_MAX_NEW_TOKENS = int(os.environ.get("NOESIS_MAX_NEW_TOKENS", "64"))
 
 # Whether to request full attentions from the model (expensive!)
-USE_ATTENTIONS = True  # set True only when explicitly want head_conflict
-
-#USE_ATTENTIONS = os.environ.get("NOESIS_USE_ATTENTIONS", "0") == "1"
+USE_ATTENTIONS = False  # set True only when explicitly want head_conflict
 
 # Only hook / sample every Nth layer for deltas & curvature
 LAYER_STRIDE = 1  # 1 = all layers, 2 = every other, 3 = every third, etc.
@@ -81,27 +81,13 @@ def make_prompt_id(label: str, prompt: str) -> str:
     h = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
     return f"{label}_{h}"
 
-def safe_fmean(data, default: float = 0.0) -> float:
-    """
-    Safe version of statistics.fmean that handles None, empty lists,
-    and other edge cases gracefully.
-    """
-    if data is None:
-        return float(default)
-    try:
-        cleaned = [float(x) for x in data if x is not None]
-        if not cleaned:
-            return float(default)
-        return float(statistics.fmean(cleaned))
-    except Exception:
-        return float(default)
 
 # -----------------------------
 #  Classifier / baseline identity
 # -----------------------------
 
 # Increment when telemetry-only classification logic changes in a way that affects comparability.
-CLASSIFIER_VERSION = "telemetry-v0.3.2"
+CLASSIFIER_VERSION = "telemetry-v0.3.0"
 
 # Optional baseline pack path (set via env var). If not present, MoE ED baseline is disabled.
 NOESIS_BASELINE_PATH = os.environ.get(
@@ -252,19 +238,18 @@ class TensionMetrics:
     per_layer_head_conflict: List[float]
     per_layer_curvature: List[float]
 
+    # OPTIONAL: model's generated response text (filled later in main)
     response_text: Optional[str] = None
+
+    # Generation parameters used for producing response_text
     gen_params: Optional[Dict[str, Any]] = None
+    # Actual number of completion tokens generated (len(response_ids))
     gen_tokens: Optional[int] = None
 
     # ===== MoE routing metrics (optional, only populated for MoE models) =====
     per_layer_moe_routing_entropy: Optional[List[float]] = None
     per_layer_moe_top_expert_ids: Optional[List[List[int]]] = None
     num_experts: Optional[int] = None
-    moe_step_stats: Optional[Dict[int, Dict[str, float]]] = None
-
-    kv_norm_drift_history: Optional[List[float]] = None
-    kv_coherence_history: Optional[List[float]] = None
-    kv_mean_norm_history: Optional[List[float]] = None
 
     # ===== Per-token band telemetry (optional; schema v0.4) =====
     # Shape:
@@ -277,12 +262,6 @@ class TensionMetrics:
     #   "z_mode": "baseline" | "unscaled"
     # }
     telemetry_bands_series: Optional[Dict[str, Any]] = None
-
-    # === NEW: Attention / KV cache features (from extended TensionTracer) ===
-    attention_entropy_per_layer: Optional[List[float]] = None
-    attention_drift_history: Optional[List[float]] = None
-    kv_reuse_scores: Optional[List[float]] = None
-    head_specialization: Optional[List[float]] = None
 
 
 @dataclass
@@ -354,7 +333,7 @@ class RegimeProbe:
 
         tail = deltas[-lookback:] if len(deltas) > lookback else deltas
         try:
-            return float(statistics.median(tail))
+            return float(median(tail))
         except Exception:
             return float(sum(tail) / len(tail))
 
@@ -382,6 +361,58 @@ class RegimeProbe:
             self.cooldown -= 1
         if getattr(self, "risk_hold", 0) > 0:
             self.risk_hold -= 1
+
+
+def should_fire_df1(probe: RegimeProbe) -> bool:
+    return False
+    # hard guards (refractory + rate limit)
+    if probe.cooldown > 0:
+        return False
+    if probe.bursts_fired >= 2:
+        return False
+
+    # instantaneous risk
+    risk_now = bool(probe.risk_state())
+    entered_risk = bool(risk_now and (not probe.prev_risk))
+
+    # latch risk for N steps AFTER first entry (hysteresis)
+    if entered_risk:
+        probe.risk_hold = max(int(probe.risk_hold), 6)
+
+    risk_latched = bool(risk_now or (probe.risk_hold > 0))
+
+    # signals
+    entropy_collapse = probe.entropy_collapse()
+    fp = probe.fp_proxy()
+    conf_trend = probe.conf_trend()
+    drift = probe.drift_proxy()
+
+    # robust drift gating
+    dmed = probe.drift_median(lookback=16)
+    drift_ok = drift > max(2.0, 2.5 * dmed)
+
+    # persistence
+    ccount = int(probe.collapse_count)
+    collapse_ok = ccount >= 2
+
+    # debug when meaningful
+    if drift_ok and entropy_collapse and probe.collapse_count >= 2:
+        print(
+            f"[DF1][gate] entered={entered_risk} risk_now={risk_now} latched={risk_latched} "
+            f"collapse={entropy_collapse} ccount={ccount} "
+            f"drift={drift:.3f} dmed={dmed:.3f} drift_ok={drift_ok} "
+            f"fp={fp} conf_trend={conf_trend} prev_risk={probe.prev_risk} hold={probe.risk_hold}"
+        )
+
+    # IMPORTANT: update edge memory at end of evaluation
+    probe.prev_risk = risk_now
+
+    # FIRE only on entry + persistence + drift anomaly, while latched
+    if entered_risk and collapse_ok and drift_ok:
+        return True
+
+    return False
+
 
 # -----------------------------
 #  Noesis Neuro-Ontological Categories (v1)
@@ -444,22 +475,39 @@ NOESIS_CATEGORIES = {
 # -----------------------------
 
 
+# micro_shock culled
 class TensionTracer:
     def __init__(self, model):
         self.model = model
 
-        self.kv_norm_drift_history: List[float] = []      # per generated token
-        self.kv_coherence_history: List[float] = []       # rolling coherence
-        self.kv_mean_norm_history: List[float] = []       # raw norm for debugging
-        self._last_kv_mean_norm: Optional[float] = None
-        self._kv_window_size: int = 8
+        # --- AT-6 micro-shock (F) controls ---
+        # These are *inference-time* perturbations intended to loosen commitment momentum
+        # without globally increasing sampling noise.
+        self._decode_step: int = 0  # set by decode loop
+        self.micro_shock_active: bool = False
+        self.micro_shock_sigma: float = (
+            0.0  # interpreted as RELATIVE fraction of local activation scale
+        )
+        self.micro_shock_sigma_abs: float | None = (
+            None  # optional absolute sigma override
+        )
+        self.micro_shock_relative: bool = True  # default: relative scaling
+        self.micro_shock_layers: set[int] = set()
+        self.micro_shock_seed: int | None = None
 
-        # Decode-step index used for per-token telemetry and MoE step aggregation.
-        self._decode_step: int = 0
+        # --- Micro-shock stdout debug controls (effect-size validation) ---
+        # Print application metrics for one layer every N steps.
+        self.micro_shock_dbg_layer: Optional[int] = (
+            None  # None => auto-pick min(micro_shock_layers) or 0
+        )
+        self.micro_shock_dbg_every: int = 8  # print every N decode steps (0 disables)
+        self.micro_shock_dbg_min_step: int = 1  # suppress step 0 noise/prime artifacts
 
         # Optional MoE gate diversification knobs (only used if MoE is present and patched)
-        self.moe_gate_noise_sigma: float = 0.0
-        self.moe_gate_bias_strength: float = 0.0
+        self.moe_gate_noise_sigma: float = 0.0  # small additive noise on gate logits
+        self.moe_gate_bias_strength: float = (
+            0.0  # small bias away from overly-stable top expert
+        )
         self._moe_top1_last: dict[int, int] = {}
         self._moe_top1_streak: dict[int, int] = {}
 
@@ -490,20 +538,14 @@ class TensionTracer:
         self.hidden_by_layer: List[torch.Tensor] = []
 
         # --- MoE routing stuff ---
+        # Per-token MoE step stats (cheap, aggregated for control loops)
+        # Filled during generation if MoE is present and patched.
         self.moe_step_stats: Dict[int, Dict[str, float]] = {}
         self._moe_step_acc: Optional[dict] = None
         self.moe_gate_trace: Dict[int, Dict[str, torch.Tensor]] = {}
-        self.moe_decode_trace: Dict[int, Dict[str, List[Any]]] = {}
         self.moe_top_k: int = 2
         self._moe_patched: bool = False
         self.moe_num_experts: Optional[int] = None
-
-        # === NEW: KV Cache + Attention features ===
-        self.attention_maps: List[torch.Tensor] = []  # last-token attention per step: [num_layers, num_heads, 1, seq]
-        self.attention_entropy_per_layer: List[float] = []  # per decode step
-        self.attention_drift_history: List[float] = []  # step-to-step attention pattern change
-        self.kv_reuse_scores: List[float] = []  # KV cache similarity to previous step
-        self.head_specialization: List[float] = []  # average head conflict over generation
 
     # ---------------------------
     # Hook logic (layer-indexed)
@@ -520,18 +562,162 @@ class TensionTracer:
 
     def _hook_block(self, layer_idx: int):
         def hook(module, input, output):
+            # ---- Robust hidden extraction ----
+            hidden = output
             is_tuple = isinstance(output, tuple)
             is_list = isinstance(output, list)
 
-            # ---- Robust hidden extraction ----
-            hidden = output
             if is_tuple or is_list:
                 hidden = output[0]
             elif hasattr(output, "last_hidden_state"):
+                # HF output object — we can read it, but we won't mutate it from a hook.
                 hidden = output.last_hidden_state
 
             if hidden is None or not hasattr(hidden, "dim"):
                 return output
+
+            # ---- Debug controls (safe defaults) ----
+            dbg_every = int(getattr(self, "micro_shock_dbg_every", 1))
+            dbg_layer = getattr(self, "micro_shock_dbg_layer", None)
+
+            if dbg_layer is None:
+                try:
+                    _layers = getattr(self, "micro_shock_layers", None)
+                    dbg_layer = int(min(_layers)) if _layers else 0
+                except Exception:
+                    dbg_layer = 0
+
+            step_i = int(getattr(self, "_decode_step", 0))
+            min_step = int(getattr(self, "micro_shock_dbg_min_step", 1))
+
+            def _should_dbg() -> bool:
+                return (
+                    int(layer_idx) == int(dbg_layer)
+                    and dbg_every > 0
+                    and (step_i % dbg_every == 0)
+                    and (step_i >= min_step)
+                )
+
+            # --- AT-6 micro-shock (F): localized entropy widening ---
+            active = bool(getattr(self, "micro_shock_active", False))
+            layers = getattr(self, "micro_shock_layers", set()) or set()
+            sigma_rel = float(getattr(self, "micro_shock_sigma", 0.0))
+
+            # IMPORTANT: only attempt to *propagate* microshock if we can return a tensor/tuple/list.
+            # If output is an HF object, we can still *capture* telemetry, but we should not pretend we actuated.
+            can_propagate = is_tuple or is_list or torch.is_tensor(output)
+
+            # --- Per-step bookkeeping: record which layers actually applied ---
+            # This creates a real bridge between "trigger" and "effect" later in the decode loop.
+            # It does NOT add extra forward passes; it's just logging state.
+            if int(getattr(self, "_micro_shock_bookkeeping_step", -999999)) != step_i:
+                self._micro_shock_bookkeeping_step = step_i
+                self._micro_shock_applied_layers_step = []
+                self._micro_shock_applied_any_step = False
+
+            if active and (layer_idx in layers) and (sigma_rel > 0.0) and can_propagate:
+                # Deterministic generator (optional)
+                gen = None
+                seed = getattr(self, "micro_shock_seed", None)
+                if seed is not None:
+                    gen = torch.Generator(device=hidden.device)
+                    gen.manual_seed(int(int(seed) + step_i * 100000 + int(layer_idx)))
+
+                # Sigma selection (abs overrides rel)
+                sigma_abs = getattr(self, "micro_shock_sigma_abs", None)
+                rel_mode = bool(getattr(self, "micro_shock_relative", True))
+
+                if hidden.dim() == 3:
+                    # [B, T, H] — only perturb last token
+                    h_last = hidden[:, -1, :]
+
+                    pre_rms = float(h_last.detach().float().pow(2).mean().sqrt().item())
+
+                    if sigma_abs is not None:
+                        sigma = float(sigma_abs)
+                    elif rel_mode:
+                        scale = (
+                            h_last.float()
+                            .std(dim=-1, unbiased=False)
+                            .mean()
+                            .clamp(min=1e-6)
+                        )
+                        sigma = float(sigma_rel) * float(scale.item())
+                    else:
+                        sigma = float(sigma_rel)
+
+                    # Generate noise in fp32 for stability, then cast
+                    noise = (
+                        torch.randn(
+                            h_last.shape,
+                            device=h_last.device,
+                            dtype=torch.float32,
+                            generator=gen,
+                        ).to(h_last.dtype)
+                        * sigma
+                    )
+
+                    hidden = hidden.clone()
+                    hidden[:, -1, :] = hidden[:, -1, :] + noise
+
+                    # Mark that actuation occurred this step and on which layer
+                    self._micro_shock_applied_any_step = True
+                    self._micro_shock_applied_layers_step.append(int(layer_idx))
+
+                    if _should_dbg():
+                        noise_rms = float(
+                            noise.detach().float().pow(2).mean().sqrt().item()
+                        )
+                        rel = noise_rms / (pre_rms + 1e-9)
+                        print(
+                            f"[microshock][apply] step={step_i} layer={int(layer_idx)} "
+                            f"pre_rms={pre_rms:.6f} noise_rms={noise_rms:.6f} rel={rel:.6f} "
+                            f"sigma={sigma:.6f} sigma_rel={sigma_rel:.6f}"
+                        )
+
+                else:
+                    # [B, H] fallback
+                    pre_rms = float(hidden.detach().float().pow(2).mean().sqrt().item())
+
+                    if sigma_abs is not None:
+                        sigma = float(sigma_abs)
+                    elif rel_mode:
+                        scale = (
+                            hidden.float()
+                            .std(dim=-1, unbiased=False)
+                            .mean()
+                            .clamp(min=1e-6)
+                        )
+                        sigma = float(sigma_rel) * float(scale.item())
+                    else:
+                        sigma = float(sigma_rel)
+
+                    noise = (
+                        torch.randn(
+                            hidden.shape,
+                            device=hidden.device,
+                            dtype=torch.float32,
+                            generator=gen,
+                        ).to(hidden.dtype)
+                        * sigma
+                    )
+
+                    hidden = hidden + noise
+
+                    # Mark that actuation occurred this step and on which layer
+                    self._micro_shock_applied_any_step = True
+                    self._micro_shock_applied_layers_step.append(int(layer_idx))
+
+                    if _should_dbg():
+                        noise_rms = float(
+                            noise.detach().float().pow(2).mean().sqrt().item()
+                        )
+                        rel = noise_rms / (pre_rms + 1e-9)
+                        print(
+                            f"[microshock][apply] step={step_i} layer={int(layer_idx)} "
+                            f"pre_rms={pre_rms:.6f} noise_rms={noise_rms:.6f} rel={rel:.6f} "
+                            f"sigma={sigma:.6f} sigma_rel={sigma_rel:.6f}"
+                        )
 
             # ---- Capture buffers ----
             self._ensure_buffers()
@@ -551,94 +737,13 @@ class TensionTracer:
                 out_list[0] = hidden
                 return out_list
             if hasattr(output, "last_hidden_state"):
+                # HF output object: don't mutate it from a hook (we also avoided actuating above).
                 return output
 
+            # Tensor output case
             return hidden
 
         return hook
-
-    def reset_attention_features(self):
-        """Reset all attention + KV features between prompts."""
-        self.attention_maps = []
-        self.attention_entropy_per_layer = []
-        self.attention_drift_history = []
-        self.kv_reuse_scores = []
-        self.head_specialization = []
-
-        # NEW KV reset
-        self.kv_norm_drift_history = []
-        self.kv_coherence_history = []
-        self.kv_mean_norm_history = []
-        self._last_kv_mean_norm = None
-
-    def _hook_attention(self, layer_idx: int):
-        def hook(module, input, output):
-            if isinstance(output, tuple) and len(output) >= 2:
-                attn_weights = output[1]  # [B, heads, seq, seq]
-                if attn_weights is not None:
-                    # Store only the last token's attention row for efficiency
-                    last_attn = attn_weights[:, :, -1:, :].detach().cpu()  # [B, heads, 1, seq]
-                    self.attention_maps.append(last_attn)
-            return output
-
-        return hook
-
-    # ====================== NEW KV CACHE HOOK ======================
-    def _hook_kv_cache(self, layer_idx: int):
-        """Hook for KV cache norm drift (only on last layer for efficiency)."""
-        def hook(module, input, output):
-            if hasattr(output, "past_key_values") and output.past_key_values is not None:
-                self._capture_kv_drift(output.past_key_values)
-            return output
-        return hook
-
-    def _capture_kv_drift(self, past_kv):
-        """Core KV telemetry: norm drift + coherence."""
-        if past_kv is None:
-            return
-
-        # Newer Transformers may return a Cache object.
-        if hasattr(past_kv, "to_legacy_cache"):
-            try:
-                past_kv = past_kv.to_legacy_cache()
-            except Exception:
-                return
-
-        if not past_kv or len(past_kv) == 0:
-            return
-
-        norms = []
-        for layer_kv in past_kv:  # usually (key, value) per layer
-            if not isinstance(layer_kv, (tuple, list)) or len(layer_kv) < 2:
-                continue
-            k, v = layer_kv[:2]
-            layer_norm = (
-                    torch.norm(k, dim=-1).mean().item() +
-                    torch.norm(v, dim=-1).mean().item()
-            )
-            norms.append(layer_norm)
-
-        current_mean_norm = float(sum(norms) / len(norms)) if norms else 0.0
-        self.kv_mean_norm_history.append(current_mean_norm)
-
-        # Norm drift
-        if self._last_kv_mean_norm is not None:
-            drift = abs(current_mean_norm - self._last_kv_mean_norm)
-            self.kv_norm_drift_history.append(drift)
-        else:
-            self.kv_norm_drift_history.append(0.0)
-
-        self._last_kv_mean_norm = current_mean_norm
-
-        # Rolling coherence (low volatility = stable KV memory)
-        if len(self.kv_norm_drift_history) >= 2:
-            window = self.kv_norm_drift_history[-self._kv_window_size:]
-            mean_win = statistics.fmean(window)
-            std_win = statistics.pstdev(window) if len(window) > 1 else 0.0
-            coherence = 1.0 - (std_win / (mean_win + 1e-8))
-            self.kv_coherence_history.append(max(0.0, min(1.0, coherence)))
-        else:
-            self.kv_coherence_history.append(1.0)
 
     def _get_layers(self):
         """Return a list-like of transformer blocks for common HF architectures.
@@ -693,6 +798,10 @@ class TensionTracer:
     # Registration / lifecycle
     # ---------------------------
     def register(self, layer_stride: int = 1):
+        """
+        Register forward hooks on every `layer_stride`-th block.
+        With layer_stride=1, this hooks every layer (recommended for per-token bands).
+        """
         self.remove()
         layers = self._get_layers()
         self.num_layers_total = len(layers)
@@ -703,29 +812,11 @@ class TensionTracer:
         for i, block in enumerate(layers):
             if layer_stride != 1 and (i % layer_stride != 0):
                 continue
-
-            # Existing block hook
-            h_block = block.register_forward_hook(self._hook_block(i))
-            self._hooks.append(h_block)
+            h = block.register_forward_hook(self._hook_block(i))
+            self._hooks.append(h)
             self.hooked_layer_indices.append(i)
 
-            if USE_ATTENTIONS:
-                # Mistral uses .self_attn, some models use .attn
-                attn_module = None
-                if hasattr(block, "self_attn"):
-                    attn_module = block.self_attn
-                elif hasattr(block, "attn"):
-                    attn_module = block.attn
-
-                if attn_module is not None:
-                    h_attn = attn_module.register_forward_hook(self._hook_attention(i))
-                    self._hooks.append(h_attn)
-
-            # KV telemetry is captured explicitly from out.past_key_values
-            # inside decode_with_band_capture(). Do not hook block outputs here,
-            # because most block outputs do not expose full past_key_values and
-            # architectures that do may cause duplicate KV samples.
-
+        # Legacy reset (not used, but kept)
         self.hidden_by_layer = []
 
     def remove(self):
@@ -735,75 +826,20 @@ class TensionTracer:
             except Exception:
                 pass
         self._hooks = []
-        self.attention_maps.clear()
 
     def clear(self):
+        # Legacy
         self.hidden_by_layer = []
+        # Indexed buffers
+        self._ensure_buffers()
         self.full_hidden_by_layer = [None] * self.num_layers_total
         self.step_layer_scalar = [None] * self.num_layers_total
-        self.attention_maps.clear()
-        self.attention_entropy_per_layer.clear()
-        self.attention_drift_history.clear()
-        self.kv_reuse_scores.clear()
-        self.head_specialization.clear()
+        # MoE
         self.moe_gate_trace = {}
-        self.moe_decode_trace = {}
         self.moe_step_stats = {}
 
-    def compute_attention_features(self):
-        """Call this after each decode step to compute attention-derived features."""
-        if not self.attention_maps or len(self.attention_maps) == 0:
-            return
-
-        # 1. Attention entropy for the most recent step
-        last_map = self.attention_maps[-1]  # [B, heads, 1, seq]
-        if last_map.numel() == 0:
-            return
-
-        attn = last_map[0, :, 0, :].float()  # [heads, seq]
-        attn_sum = attn.sum(dim=-1, keepdim=True) + 1e-12
-        attn = attn / attn_sum
-        entropy = - (attn * torch.log(attn + 1e-12)).sum(dim=-1)
-        mean_entropy = float(entropy.mean().item())
-
-        self.attention_entropy_per_layer.append(mean_entropy)
-
-        # 2. Attention drift (safe for first step)
-        if len(self.attention_maps) >= 2:
-            prev = self.attention_maps[-2][0, :, 0, :].float().flatten()
-            curr = self.attention_maps[-1][0, :, 0, :].float().flatten()
-
-            shared_len = min(prev.numel(), curr.numel())
-            if shared_len <= 0:
-                self.attention_drift_history.append(0.0)
-            else:
-                prev = prev[-shared_len:]
-                curr = curr[-shared_len:]
-
-                prev_norm = prev.norm() + 1e-12
-                curr_norm = curr.norm() + 1e-12
-
-                prev = prev / prev_norm
-                curr = curr / curr_norm
-
-                sim = float(torch.dot(prev, curr).item())
-                drift = 1.0 - sim
-                self.attention_drift_history.append(drift)
-        else:
-            self.attention_drift_history.append(0.0)  # neutral for first token
-
-        # 3. KV reuse score = 1 - drift
-        if self.attention_drift_history:
-            reuse = 1.0 - self.attention_drift_history[-1]
-            self.kv_reuse_scores.append(reuse)
-        else:
-            self.kv_reuse_scores.append(1.0)
-
-        # 4. Head specialization (reuse entropy for now)
-        self.head_specialization.append(mean_entropy)
-
     # ---------------------------
-    # Decode-step telemetry controls
+    # AT-6 Micro-shock controls
     # ---------------------------
     def set_decode_step(self, step: int):
         """Mark the current decode step and reset per-step capture buffers.
@@ -909,6 +945,68 @@ class TensionTracer:
             "routing_top1_mode_frac": float(mode_frac),
         }
 
+    def enable_micro_shock(
+        self, layers: set[int] | list[int], sigma: float, *, seed: int | None = None
+    ):
+        """
+        Enable localized hidden-state perturbation for specified layers.
+
+        sigma is interpreted as a RELATIVE fraction of local activation scale (see _hook_block).
+        """
+        # Normalize layers input defensively
+        try:
+            layer_set = set(int(x) for x in layers)
+        except Exception:
+            layer_set = set()
+
+        if not layer_set:
+            # If someone calls enable with an empty set, don't arm a ghost actuator.
+            self.micro_shock_active = False
+            self.micro_shock_layers = set()
+            return
+
+        self.micro_shock_active = True
+        self.micro_shock_layers = layer_set  # <-- obey policy, do not override here
+        self.micro_shock_relative = True
+        self.micro_shock_sigma_abs = None
+        self.micro_shock_sigma = float(sigma)
+        self.micro_shock_seed = int(seed) if seed is not None else None
+
+        # --- Observable meaning: capture + optionally print what was armed ---
+        # (This kills the "why is it only layer 0" confusion immediately.)
+        try:
+            lmin = int(min(layer_set))
+            lmax = int(max(layer_set))
+            lcount = int(len(layer_set))
+            preview = sorted(layer_set)[:8]
+        except Exception:
+            lmin, lmax, lcount, preview = -1, -1, -1, []
+
+        self.micro_shock_last_enable_step = int(getattr(self, "_decode_step", 0))
+        self.micro_shock_last_enable_summary = {
+            "step": self.micro_shock_last_enable_step,
+            "n_layers": lcount,
+            "min_layer": lmin,
+            "max_layer": lmax,
+            "preview": preview,
+            "sigma_rel": float(self.micro_shock_sigma),
+            "seed": self.micro_shock_seed,
+        }
+
+        # Default: print arming semantics once (can be silenced by setting attribute to False)
+        if bool(getattr(self, "micro_shock_print_enable", True)):
+            print(
+                f"[microshock][enable] step={self.micro_shock_last_enable_step} "
+                f"layers=n{lcount}({lmin}-{lmax}) preview={preview} "
+                f"sigma_rel={float(self.micro_shock_sigma):.6f} seed={self.micro_shock_seed}"
+            )
+
+    def disable_micro_shock(self):
+        self.micro_shock_active = False
+        self.micro_shock_layers = set()
+        self.micro_shock_sigma = 0.0
+        self.micro_shock_seed = None
+
     def configure_moe_diversification(
         self, *, gate_noise_sigma: float = 0.0, gate_bias_strength: float = 0.0
     ):
@@ -925,7 +1023,6 @@ class TensionTracer:
 
         self.moe_top_k = top_k
         self.moe_gate_trace = {}
-        self.moe_decode_trace = {}
 
         def patch_moe_gate(moe_block, layer_index: int):
             original_forward = moe_block.forward
@@ -936,9 +1033,27 @@ class TensionTracer:
                 try:
                     gate_logits = block_self.gate(hidden_states)
 
+                    # --- AT-6 micro-shock (F): MoE diversification knobs ---
+                    if self.moe_gate_noise_sigma and self.moe_gate_noise_sigma > 0.0:
+                        gen = None
+                        if self.micro_shock_seed is not None:
+                            gen = torch.Generator(device=gate_logits.device)
+                            gen.manual_seed(
+                                int(
+                                    self.micro_shock_seed
+                                    + self._decode_step * 100000
+                                    + layer_index
+                                    + 4242
+                                )
+                            )
+                        gate_logits = gate_logits + (
+                            torch.randn_like(gate_logits, generator=gen)
+                            * float(self.moe_gate_noise_sigma)
+                        )
+
                     if (
-                            self.moe_gate_bias_strength
-                            and self.moe_gate_bias_strength > 0.0
+                        self.moe_gate_bias_strength
+                        and self.moe_gate_bias_strength > 0.0
                     ):
                         # Bias away from an overly-stable top expert streak for the last token position.
                         # We only touch the final token to keep it localized.
@@ -952,20 +1067,23 @@ class TensionTracer:
                             last = self._moe_top1_last.get(layer_index)
                             if last == top1:
                                 self._moe_top1_streak[layer_index] = (
-                                        self._moe_top1_streak.get(layer_index, 1) + 1
+                                    self._moe_top1_streak.get(layer_index, 1) + 1
                                 )
                             else:
                                 self._moe_top1_streak[layer_index] = 1
                             self._moe_top1_last[layer_index] = top1
 
+                            # After a short streak, apply a tiny negative bias to the dominant expert.
                             if self._moe_top1_streak[layer_index] >= 3:
                                 bias = float(self.moe_gate_bias_strength)
                                 if gate_logits.dim() == 3:
-                                    gate_logits[:, -1, top1] = gate_logits[:, -1, top1] - bias
+                                    gate_logits[:, -1, top1] = (
+                                        gate_logits[:, -1, top1] - bias
+                                    )
                                 else:
                                     gate_logits[:, top1] = gate_logits[:, top1] - bias
 
-                    # --- Cheap per-token routing stats + decode-time aggregate trace ---
+                    # --- Cheap per-token routing stats (for control decisions) ---
                     try:
                         with torch.no_grad():
                             gl_last = (
@@ -973,47 +1091,28 @@ class TensionTracer:
                                 if gate_logits.dim() == 3
                                 else gate_logits
                             )  # [B, E]
-
                             p = F.softmax(gl_last.float(), dim=-1)
+                            # Mean over batch to keep it cheap/stable
                             p_mean = p.mean(dim=0)
-
                             entropy = float(
-                                -(p_mean * p_mean.clamp(min=1e-9).log()).sum().item()
+                                -(p_mean * (p_mean.clamp(min=1e-9)).log()).sum().item()
                             )
                             top1 = int(torch.argmax(p_mean, dim=-1).item())
                             top1_prob = float(p_mean[top1].item())
-
                             if self._moe_step_acc is not None:
                                 self._moe_step_acc["n"] += 1
                                 self._moe_step_acc["entropy_sum"] += entropy
                                 self._moe_step_acc["top1_prob_sum"] += top1_prob
                                 c = self._moe_step_acc["top1_counts"]
                                 c[top1] = c.get(top1, 0) + 1
-
-                                layer_trace = self.moe_decode_trace.setdefault(
-                                    int(layer_index),
-                                    {
-                                        "entropy": [],
-                                        "top1": [],
-                                        "top1_prob": [],
-                                        "step": [],
-                                    },
-                                )
-                                layer_trace["entropy"].append(float(entropy))
-                                layer_trace["top1"].append(int(top1))
-                                layer_trace["top1_prob"].append(float(top1_prob))
-                                layer_trace["step"].append(int(self._decode_step))
                     except Exception:
                         pass
-
                     if self.moe_num_experts is None:
                         self.moe_num_experts = gate_logits.size(-1)
 
                     top_scores, top_indices = gate_logits.topk(self.moe_top_k, dim=-1)
                     gates = F.softmax(top_scores, dim=-1)
 
-                    # Last forward snapshot. Useful for prompt-pass debugging, but decode aggregate
-                    # should be preferred for generated-response MoE metrics.
                     self.moe_gate_trace[layer_index] = {
                         "gates": gates.detach().cpu(),
                         "indices": top_indices.detach().cpu(),
@@ -1233,6 +1332,7 @@ def compute_moe_anomaly(
         },
     }
 
+
 def build_trace_from_metrics(
     metrics: TensionMetrics,
     model,
@@ -1338,31 +1438,11 @@ def build_trace_from_metrics(
         drift=drift_val,
     )
 
-    # ====================== ROBUST KV CACHE FEATURES ======================
-    kv_drift_hist = getattr(metrics, "kv_norm_drift_history", None) or []
-    kv_coherence_hist = getattr(metrics, "kv_coherence_history", None) or []
-    kv_mean_norm_hist = getattr(metrics, "kv_mean_norm_history", None) or []
-
-    kv_mean_coherence = float(statistics.fmean(kv_coherence_hist)) if kv_coherence_hist else 0.75
-    kv_max_drift = float(max(kv_drift_hist)) if kv_drift_hist else 0.0
-    kv_final_drift = float(kv_drift_hist[-1]) if kv_drift_hist else 0.0
-    kv_num_tokens = len(kv_drift_hist)
     if is_safety_liminal:
         archetype_name = "safety_liminality"
     else:
         archetype_name = None
 
-    kv_features = {
-        "kv_norm_drift_history": kv_drift_hist,
-        "kv_coherence_history": kv_coherence_hist,
-        "kv_mean_norm_history": kv_mean_norm_hist,
-        "kv_final_drift": kv_final_drift,
-        "kv_mean_coherence": kv_mean_coherence,
-        "kv_max_drift": kv_max_drift,
-        "kv_num_tokens": kv_num_tokens,
-    }
-
-    # Layer construction
     # Per-layer count (declared preferred)
     num_layers = (
         getattr(model.config, "num_hidden_layers", None)
@@ -1542,7 +1622,6 @@ def build_trace_from_metrics(
         regime_baseline=regime_baseline,
     )
 
-
     # --- Classification stability (Phase III, telemetry-only) ---
     stability_v0 = compute_stability_v0(
         metrics=metrics,
@@ -1555,7 +1634,6 @@ def build_trace_from_metrics(
     )
     # Attach next to the regime decision so downstream ingest can treat it as canonical.
     regime_info["stability_v0"] = stability_v0
-
 
     # Pull spike diagnostics (written into gen_params by compute_tension_for_prompt)
     spike_layer_idx = (metrics.gen_params or {}).get("delta_spike_transition_idx")
@@ -1576,12 +1654,9 @@ def build_trace_from_metrics(
         "archetype": archetype_name,
         "is_safety_liminality": is_safety_liminal,
         "cognitive_regime": regime_info["label"],
-        "delta_spike_transition_idx": (metrics.gen_params or {}).get("delta_spike_transition_idx"),
-        "delta_spike_ratio_vs_median": (metrics.gen_params or {}).get("delta_spike_ratio_vs_median"),
-        # KV summary
-        "kv_mean_coherence": kv_mean_coherence,
-        "kv_max_drift": kv_max_drift,
-        "kv_num_tokens": kv_num_tokens,
+        # NEW: spike diagnostics
+        "delta_spike_transition_idx": spike_layer_idx,
+        "delta_spike_ratio_vs_median": spike_ratio,
     }
 
     extras: Dict[str, Any] = {
@@ -1590,15 +1665,29 @@ def build_trace_from_metrics(
             "profile": noesis_profile,
             "cognitive_regime": regime_info,
         },
-        # === NEW: Attention / KV cache features ===
-        "attention_features": {
-            "attention_entropy_per_layer": getattr(metrics, "attention_entropy_per_layer", None),
-            "attention_drift_history": getattr(metrics, "attention_drift_history", None),
-            "kv_reuse_scores": getattr(metrics, "kv_reuse_scores", None),
-            "head_specialization": getattr(metrics, "head_specialization", None),
-        },
-        "kv_cache": kv_features,
+        # "text_annotations": text_annotations,
         "telemetry_bands": telemetry_bands,
+        "interventions": {
+            # Micro-shock configuration (if present)
+            "micro_shock": {
+                k: (metrics.gen_params or {}).get(k)
+                for k in (
+                    "micro_shock_autotrigger",
+                    "micro_shock_trigger_N",
+                    "micro_shock_duration",
+                    "micro_shock_sigma_rel",
+                    "micro_shock_sigma_abs",
+                    "micro_shock_entropy_drop",
+                    "micro_shock_conf_rise",
+                    "micro_shock_layers",
+                    "moe_gate_noise_sigma",
+                    "moe_gate_bias_strength",
+                )
+                if (metrics.gen_params or {}).get(k) is not None
+            },
+            # Per-token MoE routing control stats captured during decode (full per-token dict)
+            "moe_step_stats": getattr(metrics, "moe_step_stats", None),
+        },
     }
 
     # --- MoE routing summary (if present) ---
@@ -1654,8 +1743,8 @@ def build_trace_from_metrics(
         }
 
     trace = Trace(
-        schema_version="v0.3.2",
-        noesis_version="0.3.2",
+        schema_version="v3.0-stable",
+        noesis_version="0.3.0",
         model=model_info,
         run=run_info,
         tokens=tokens_info,
@@ -1668,9 +1757,7 @@ def build_trace_from_metrics(
 
 
 def save_trace(trace: Trace, out_path: str):
-    out_dir = os.path.dirname(out_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         f.write(trace.to_json_str(indent=2))
 
@@ -1802,18 +1889,15 @@ def compute_hti_v2_for_metric(
 def classify_safety_liminality(
     metrics: TensionMetrics,
     idx_of_max_delta: int,
-    tension: Optional[float],
-    drift: Optional[float],
+    tension: float,
+    drift: float,
 ) -> bool:
     """
     Safety Liminality — telemetry-only.
     Intended to capture "I can't / I'm sorry" border-state behavior WITHOUT reading text.
     """
-    if idx_of_max_delta is None:
-        return False
-
-    t = float(tension) if tension is not None else 0.5
-    d = float(drift) if drift is not None else 0.5
+    t = float(tension)
+    d = float(drift)
 
     # Typical signature: high drift, mid tension, elevated entropy, and a distinct mid/late delta spike.
     high_drift = d >= 0.60
@@ -1831,7 +1915,6 @@ def classify_safety_liminality(
         and low_conflict
         and mid_or_late_spike
     )
-
 
 
 def telemetry_noesis_profile(
@@ -1965,6 +2048,7 @@ def telemetry_noesis_profile(
         },
     }
 
+
 def infer_cognitive_regime(
     metrics: TensionMetrics,
     noesis_profile: Dict[str, Any],
@@ -1974,217 +2058,192 @@ def infer_cognitive_regime(
     regime_baseline: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
-    Classify cognitive regime using HTI + Noesis profile + KV telemetry.
+    Classify a high-level 'cognitive regime' for this trace using:
+    - HTI v0.2 (tension vs drift)
+    - Noesis category profile
+    - Safety flag only
+    - Telemetry-only signals (no prompt/response string logic)
 
-    KV interpretation:
-      - high coherence + low final drift => stable/procedural or repetitive regime
-      - high coherence + symbolic drift => symbolic_repetitive_drift
-      - high final drift or rising norm trend => active rewrite / liminal instability
+    v3: RAP / reflexive_alignment_panic completely removed.
     """
+
+    # ---- Helpers ----
     def safe(x, default=0.5):
         return float(x) if x is not None else default
 
     def clamp01(x: float) -> float:
-        return float(max(0.0, min(1.0, x)))
-
-    def recent_mean(xs, window: int = 12, default: float = 0.0) -> float:
-        if not xs:
-            return float(default)
-        tail = [float(x) for x in xs[-window:] if x is not None]
-        return float(sum(tail) / len(tail)) if tail else float(default)
-
-    def relative_trend(xs, window: int = 12) -> float:
-        """
-        Relative late-vs-early trend in the recent KV mean norm series.
-        Positive => norm accumulation.
-        Negative => norm decay.
-        """
-        if not xs or len(xs) < 4:
+        if x < 0.0:
             return 0.0
-
-        tail = [float(x) for x in xs[-window:] if x is not None]
-        if len(tail) < 4:
-            return 0.0
-
-        mid = len(tail) // 2
-        early = tail[:mid]
-        late = tail[mid:]
-
-        early_mean = sum(early) / max(len(early), 1)
-        late_mean = sum(late) / max(len(late), 1)
-
-        denom = abs(early_mean) + 1e-8
-        return float((late_mean - early_mean) / denom)
+        if x > 1.0:
+            return 1.0
+        return x
 
     tension = safe(tension_index, 0.5)
     drift = safe(drift_index, 0.5)
 
-    vec = noesis_profile.get("vector") or [0.0] * 12
-
-    moral_paradox = float(vec[0] or 0.0)
-    false_presupposition = float(vec[1] or 0.0)
-    symbolism = float(vec[6] or 0.0)
-    ambiguous_containment = float(vec[7] or 0.0)
-    paradox_pressure = float(vec[9] or 0.0)
-
-    # ====================== KV Cache Aggregates ======================
-    kv_drift_list = getattr(metrics, "kv_norm_drift_history", None) or []
-    kv_coherence_list = getattr(metrics, "kv_coherence_history", None) or []
-    kv_mean_norm_list = getattr(metrics, "kv_mean_norm_history", None) or []
-
-    recent_kv_drift = recent_mean(kv_drift_list, window=12, default=0.0)
-    recent_kv_coherence = recent_mean(kv_coherence_list, window=12, default=0.75)
-    recent_kv_mean_norm = recent_mean(kv_mean_norm_list, window=12, default=0.0)
-
-    kv_final_drift = float(kv_drift_list[-1]) if kv_drift_list else 0.0
-    kv_max_drift = float(max(kv_drift_list)) if kv_drift_list else 0.0
-    kv_norm_trend = relative_trend(kv_mean_norm_list, window=12)
-
-    # Drift scale is heuristic because raw KV norms are model-dependent.
-    # Keep this conservative and mostly use coherence + relative trend.
-    drift_pressure = clamp01(max(recent_kv_drift, kv_final_drift) * 1.0)
-    trend_pressure = clamp01(max(0.0, kv_norm_trend) * 4.0)
-
-    kv_stability = clamp01(recent_kv_coherence * (1.0 - drift_pressure))
-    kv_instability = clamp01(1.0 - kv_stability + 0.25 * trend_pressure)
-
-    kv_features = {
-        "kv_stability": kv_stability,
-        "kv_instability": kv_instability,
-        "kv_recent_drift": recent_kv_drift,
-        "kv_final_drift": kv_final_drift,
-        "kv_max_drift": kv_max_drift,
-        "kv_recent_coherence": recent_kv_coherence,
-        "kv_recent_mean_norm": recent_kv_mean_norm,
-        "kv_norm_trend": kv_norm_trend,
-        "kv_num_tokens": len(kv_drift_list),
-    }
-
-    # ====================== Core Regime Logic ======================
-    spike_ratio = (metrics.gen_params or {}).get("delta_spike_ratio_vs_median", 0.0)
-    spike_ratio = float(spike_ratio or 0.0)
-
-    high_tension = (tension >= 0.69) and (spike_ratio > 9.0)
+    # Banding
+    high_tension = tension >= 0.67   # or 0.68
     low_tension = tension <= 0.40
     high_drift = drift >= 0.60
     mid_drift = 0.45 <= drift < 0.60
     low_drift = drift < 0.45
 
-    attn_entropy_list = getattr(metrics, "attention_entropy_per_layer", None) or []
-    recent_entropy = recent_mean(attn_entropy_list, window=8, default=1.5)
-    low_entropy = recent_entropy < 1.1
+    vec = noesis_profile.get("vector") or [0.0] * 12
 
-    symbolic_score = max(symbolism, ambiguous_containment, float(vec[10] or 0.0))
+    # Noesis category shorthand
+    moral_paradox = vec[0]
+    false_presupposition = vec[1]
+    category_collision = vec[4]
+    symbolism = vec[6]
+    ambiguous_containment = vec[7]
+    paradox_pressure = vec[9]
+    aesthetic_logic = vec[10]
 
-    # === Hard overrides ===
-    if is_safety_liminal:
-        if (mid_drift or high_drift) and kv_stability > 0.82 and symbolic_score >= 0.085:
-            return {
-                "label": "symbolic_repetitive_drift",
-                "explanation": "Safety liminality + symbolic signal + highly stable KV trajectory.",
-                "features": {
-                    "tension": tension,
-                    "drift": drift,
-                    "symbolism": symbolism,
-                    **kv_features,
-                },
-            }
+    # Telemetry helpers
+    mean_entropy = float(getattr(metrics, "mean_logit_entropy", 0.0) or 0.0)
+    final_entropy = float(getattr(metrics, "final_token_entropy", 0.0) or 0.0)
+    entropy_collapse = (mean_entropy > 1e-9) and (final_entropy < 0.85 * mean_entropy)
+    entropy_sustained = (mean_entropy > 1e-9) and (final_entropy >= 0.95 * mean_entropy)
 
+    # ---- Hard override (safety_liminality only) ----
+    symbolic_score = max(symbolism, ambiguous_containment, aesthetic_logic)
+    if (
+        is_safety_liminal
+        and (mid_drift or high_drift)
+        and symbolic_score >= 0.085
+        and false_presupposition < 0.065
+    ):
         return {
-            "label": "safety_liminality",
-            "explanation": "Explicit safety liminality flag.",
+            "label": "symbolic_repetitive_drift",
+            "explanation": "Safety_liminality flag present, but strong symbolic/ambiguous signals dominate → surreal repetitive drift.",
             "features": {
                 "tension": tension,
                 "drift": drift,
-                **kv_features,
+                "symbolism": symbolism,
+                "ambiguous_containment": ambiguous_containment,
+                "aesthetic_logic": aesthetic_logic,
             },
         }
 
-    # === Main regimes ===
+    if is_safety_liminal:
+        return {
+            "label": "safety_liminality",
+            "explanation": "Explicit safety liminality flag.",
+            "features": {"tension": tension, "drift": drift},
+        }
+
+    # ---- Ethical / false-premise / mythic / hallucination regimes ----
     if high_tension and moral_paradox > 0.25:
         return {
             "label": "ethical_paradox",
-            "explanation": "High tension with strong moral-conflict telemetry.",
+            "explanation": "Strong moral/ethical conflict under high tension.",
             "features": {
                 "tension": tension,
                 "drift": drift,
                 "moral_paradox": moral_paradox,
-                **kv_features,
             },
         }
 
     if high_drift and false_presupposition > 0.25:
         return {
             "label": "false_premise_buckling",
-            "explanation": "High drift with strong false-presupposition telemetry.",
+            "explanation": "High drift with strong false-presupposition signal.",
             "features": {
                 "tension": tension,
                 "drift": drift,
                 "false_presupposition": false_presupposition,
-                **kv_features,
             },
         }
 
-    if (mid_drift or high_drift) and symbolic_score > 0.16 and kv_stability > 0.78:
+    if (mid_drift or high_drift) and symbolism > 0.18:
         return {
-            "label": "symbolic_repetitive_drift",
-            "explanation": "Symbolic drift with stable KV memory trajectory.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "symbolic_score": symbolic_score,
-                **kv_features,
-            },
+            "label": "mythic_drift",
+            "explanation": "High symbolic/mythic content with moderate-to-high drift.",
+            "features": {"tension": tension, "drift": drift, "symbolism": symbolism},
         }
 
     if low_tension and high_drift and false_presupposition < 0.12:
         return {
             "label": "confident_hallucination_lite",
-            "explanation": "Low tension and high drift without strong false-premise category concentration.",
+            "explanation": "Low tension, high drift, confident fabrication.",
             "features": {
                 "tension": tension,
                 "drift": drift,
                 "false_presupposition": false_presupposition,
-                **kv_features,
             },
         }
 
-    if low_drift and false_presupposition < 0.12 and (kv_stability > 0.75 or low_entropy):
+    # ---- Symbolic Repetitive Drift ----
+    if (
+        (mid_drift or high_drift)
+        and symbolic_score >= 0.085
+        and false_presupposition < 0.065
+    ):
         return {
-            "label": "safety_procedural",
-            "explanation": "Low drift with stable/procedural KV context.",
+            "label": "symbolic_repetitive_drift",
+            "explanation": "Mid/high drift with strong emergent symbolism, ambiguous containment, or aesthetic-logic crosswiring; repetitive surreal looping.",
             "features": {
                 "tension": tension,
                 "drift": drift,
-                "low_entropy": low_entropy,
-                **kv_features,
+                "symbolism": symbolism,
+                "ambiguous_containment": ambiguous_containment,
+                "aesthetic_logic": aesthetic_logic,
+                "mean_entropy": mean_entropy,
+                "final_entropy": final_entropy,
             },
         }
 
-    if (high_drift or mid_drift) and kv_instability > 0.45 and (
-        ambiguous_containment > 0.20 or paradox_pressure > 0.20
+    # ---- Safety / Procedural Reasoning (high-tension friendly) ----
+    if low_drift and false_presupposition < 0.12:
+        return {
+            "label": "safety_procedural",
+            "explanation": "Low drift with modest-to-high tension and little paradox or false-premise signal; likely procedural reasoning.",
+            "features": {"tension": tension, "drift": drift},
+        }
+
+    # ---- Remaining regimes ----
+    if (
+        (high_drift or mid_drift)
+        and false_presupposition < 0.12
+        and moral_paradox > 0.25
+    ):
+        return {
+            "label": "procedural_oddity",
+            "explanation": "Moral/justification pressure under drift without strong false-premise.",
+            "features": {
+                "tension": tension,
+                "drift": drift,
+                "moral_paradox": moral_paradox,
+            },
+        }
+
+    if (mid_drift or high_drift) and (
+        ambiguous_containment > 0.20
+        or paradox_pressure > 0.20
+        or category_collision > 0.20
     ):
         return {
             "label": "liminal_drift",
-            "explanation": "Ambiguous/paradoxical framing with unstable KV trajectory.",
+            "explanation": "Intermediate or high drift with ambiguous or paradoxical framing.",
             "features": {
                 "tension": tension,
                 "drift": drift,
                 "ambiguous_containment": ambiguous_containment,
                 "paradox_pressure": paradox_pressure,
-                **kv_features,
             },
         }
 
+    # ---- Fallback ----
     return {
         "label": "mixed_unclear",
-        "explanation": "No strong signature detected.",
+        "explanation": "No strong signature for any single regime.",
         "features": {
             "tension": tension,
             "drift": drift,
-            **kv_features,
+            "noesis_top": noesis_profile.get("top_indices"),
         },
     }
+
 
 def compute_stability_v0(
     *,
@@ -2296,6 +2355,7 @@ def compute_stability_v0(
         "margin_bucket": bucket,
         "label_matches_top": bool(regime_label == top_regime),
     }
+
 
 # -----------------------------
 #  Utility: Entropy
@@ -2419,7 +2479,10 @@ def compute_curvature_from_hidden(
     return curvatures
 
 
+# -----------------------------
 #  Core: run model + extract tension
+# -----------------------------
+
 
 def _band_ranges(n: int) -> dict:
     if n <= 1:
@@ -2431,6 +2494,7 @@ def _band_ranges(n: int) -> dict:
         "mid": [a, max(a, b - 1)],
         "late": [b, n - 1],
     }
+
 
 @torch.no_grad()
 def decode_with_band_capture(
@@ -2456,7 +2520,7 @@ def decode_with_band_capture(
     zE, zM, zL = [], [], []
     warmstart_outlier_observed = False
 
-    # Prime KV cache with full prompt. Telemetry from this warm-start pass is ignored.
+    # Prime KV cache with full prompt (ignore telemetry here)
     tracer.set_mode_step()
     tracer.clear_step()
     out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
@@ -2464,13 +2528,33 @@ def decode_with_band_capture(
 
     full_ids = input_ids
 
-    # DF-1 regime probe state.
+    # ---- DF-1 Regime Probe ----
     probe = RegimeProbe(
         ent_hist=deque(maxlen=8),
         conf_hist=deque(maxlen=6),
         margin_hist=deque(maxlen=6),
-        drift_hist=deque(maxlen=64),
+        drift_hist=deque(maxlen=64),  # RAW (zm+zl)
     )
+
+    shock_remaining = 0
+
+    early0, early1 = ranges["early"]
+    mid0, mid1 = ranges["mid"]
+    early_mid_layers = set(range(int(early0), int(early1) + 1)) | set(
+        range(int(mid0), int(mid1) + 1)
+    )
+
+    print("[bands]", ranges)
+
+    if early_mid_layers:
+        print(
+            "[early_mid]",
+            min(early_mid_layers),
+            max(early_mid_layers),
+            len(early_mid_layers),
+        )
+    else:
+        print("[early_mid] EMPTY")
 
     def _temp_for_stats():
         return (
@@ -2480,13 +2564,11 @@ def decode_with_band_capture(
     for _t in range(max_new_tokens):
         logits_raw = out.logits[:, -1, :]
 
-        # Compute token-level stats for regime probe logic.
+        # ---- ALWAYS compute stats for DF-1 logic ----
         probs_stats = F.softmax(logits_raw / _temp_for_stats(), dim=-1)
         p = probs_stats.float()
 
-        token_entropy = float(
-            -(p * p.clamp(min=1e-9).log()).sum(dim=-1).mean().item()
-        )
+        token_entropy = float(-(p * p.clamp(min=1e-9).log()).sum(dim=-1).mean().item())
         token_conf = float(p.max(dim=-1).values.mean().item())
 
         sorted_p, _ = torch.sort(p, descending=True)
@@ -2496,7 +2578,7 @@ def decode_with_band_capture(
         probe.conf_hist.append(token_conf)
         probe.margin_hist.append(token_margin)
 
-        # Select next token.
+        # ---- Token selection ----
         if do_sample:
             temp = (
                 float(temperature)
@@ -2512,7 +2594,7 @@ def decode_with_band_capture(
                 cum = torch.cumsum(probs, dim=-1)
 
                 mask = cum > pval
-                mask[..., 0] = False
+                mask[..., 0] = False  # keep at least 1 token
                 sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
                 logits = torch.zeros_like(logits).scatter(1, sorted_idx, sorted_logits)
 
@@ -2521,46 +2603,34 @@ def decode_with_band_capture(
         else:
             next_id = torch.argmax(logits_raw, dim=-1, keepdim=True)
 
+        # Append token
         full_ids = torch.cat([full_ids, next_id], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_id)], dim=1)
 
+        # EOS stop
         if eos_id is not None and int(next_id.item()) == int(eos_id):
             break
 
-        # Prepare tracer for this decode step.
+        # Prepare tracer for THIS decode step
         tracer.set_mode_step()
         tracer.clear_step()
         tracer.set_decode_step(_t)
 
-        # Decode one token using the existing KV cache.
+        # ---- Forward 1 token ----
         out = model(
             input_ids=next_id,
             attention_mask=attention_mask,
             past_key_values=past,
             use_cache=True,
-            output_attentions=USE_ATTENTIONS,
-            return_dict=True,
         )
         past = out.past_key_values
-
-        # Capture KV telemetry directly from the returned cache.
-        if past is not None:
-            tracer._capture_kv_drift(past)
-
-        tracer.compute_attention_features()
         tracer.finalize_step_stats()
 
-        # Capture per-token band telemetry.
+        # Read telemetry bands
         step = tracer.get_step_band_z(ranges)
+        ze, zm, zl = float(step["z_early"]), float(step["z_mid"]), float(step["z_late"])
 
-        def _finite_or_zero(x: float) -> float:
-            x = float(x)
-            return x if math.isfinite(x) else 0.0
-
-        ze = _finite_or_zero(step["z_early"])
-        zm = _finite_or_zero(step["z_mid"])
-        zl = _finite_or_zero(step["z_late"])
-
+        # Warm-start edge handling
         if _t == 0:
             if max(ze, zm, zl) > 50.0:
                 warmstart_outlier_observed = True
@@ -2573,15 +2643,40 @@ def decode_with_band_capture(
             zM.append(zm)
             zL.append(zl)
 
-        # Store raw mid+late activity for drift probe diagnostics.
-        raw = _finite_or_zero(zm + zl)
-        raw = max(min(raw, 60.0), -60.0)
+        # ---- Drift series (RAW zm+zl) ----
+        raw = float(zm + zl)
+        raw = max(min(raw, 60.0), -60.0)  # clamp raw band sum
         probe.drift_hist.append(raw)
 
+        # ---- Collapse persistence (ccount) ----
         if probe.entropy_collapse():
             probe.collapse_count += 1
         else:
             probe.collapse_count = 0
+
+        # ---- DF-1 trigger ----
+        if shock_remaining <= 0 and should_fire_df1(probe):
+            tracer.enable_micro_shock(
+                early_mid_layers,
+                sigma=0.0015,
+                seed=getattr(tracer, "micro_shock_seed", None),
+            )
+            shock_remaining = 6
+            probe.cooldown = 18
+            probe.bursts_fired += 1
+            print(
+                f"[DF-1] FIRE t={_t} ent={token_entropy:.3f} conf={token_conf:.3f} drift={probe.drift_proxy():.3f}"
+            )
+
+        # ---- Shock countdown + disable ----
+        if shock_remaining > 0:
+            shock_remaining -= 1
+            if shock_remaining == 0:
+                tracer.disable_micro_shock()
+                print(f"[DF-1] DISABLE t={_t}")
+
+        # ---- single source of truth for cooldown/hold decay ----
+        probe.tick()
 
     telemetry_bands = {
         "generated_token_count": len(zE),
@@ -2600,28 +2695,23 @@ def decode_with_band_capture(
 
     return full_ids[0], telemetry_bands
 
-
-
-@torch.no_grad()
 def compute_tension_for_prompt(
-        model,
-        tokenizer,
-        tracer,
-        prompt: str,
-        label: str,
-        *,
-        experiment_id: str | None = None,
-        prompt_id: str | None = None,
-        do_sample: bool = False,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        max_new_tokens: int = 256,
-        seed: int | None = None,
+    model,
+    tokenizer,
+    tracer,
+    prompt: str,
+    label: str,
+    *,
+    experiment_id: str | None = None,
+    prompt_id: str | None = None,
+    do_sample: bool = False,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_new_tokens: int = 256,
+    seed: int | None = None,
 ):
-    """Main entry point: run a prompt and return full TensionMetrics (with KV telemetry)."""
     tracer.clear()
-    tracer.reset_attention_features()  # Now also resets KV buffers
-    tracer.register(layer_stride=LAYER_STRIDE)
+    tracer.register(layer_stride=LAYER_STRIDE)  # stride=1
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
@@ -2631,21 +2721,20 @@ def compute_tension_for_prompt(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    # ---- Initial forward pass (for hidden states + initial KV) ----
+    # ---- Initial forward pass (single pass) for layer metrics ----
     with torch.no_grad():
         outputs = model(
             **inputs,
             output_hidden_states=True,
             output_attentions=USE_ATTENTIONS,
             return_dict=True,
-            use_cache=True,
         )
 
-    # Snapshot MoE gates
+    # Snapshot MoE gates from this forward pass
     moe_gate_snapshot = dict(tracer.moe_gate_trace) if tracer.moe_gate_trace else {}
     num_experts = tracer.moe_num_experts
 
-    # Determine num_layers
+    # Determine num_layers for banding
     num_layers = int(
         getattr(model.config, "num_hidden_layers", 0)
         or getattr(model.config, "n_layer", 0)
@@ -2658,13 +2747,15 @@ def compute_tension_for_prompt(
 
     ranges = _band_ranges(num_layers)
 
-    # ---- Decode with per-token band + KV capture ----
-    tracer.capture_mode = "step"
-    tracer.moe_step_stats = {}
+    # ---- Decode prep (per-token telemetry) ----
+    tracer.capture_mode = "step"  # required for step_layer_scalar -> band z-series
+    tracer.moe_step_stats = {}  # keep per-run stats clean (harmless on non-MoE)
 
-    # tracer._ensure_buffers()
+    # Optional: clear any stale per-layer scalars
+    tracer._ensure_buffers()
     tracer.step_layer_scalar = [None] * tracer.num_layers_total
 
+    # ---- Decode with per-token band capture ----
     full_ids, telemetry_bands = decode_with_band_capture(
         model,
         tokenizer,
@@ -2694,41 +2785,22 @@ def compute_tension_for_prompt(
 
     gen_tokens = int(len(response_ids))
 
-    # ---- Hidden states hygiene ----
+    # ---- Hidden states from initial forward pass ----
+    if outputs.hidden_states is None:
+        raise RuntimeError("hidden_states unexpectedly None")
+
+    # ---- Hidden state hygiene ----
     hs_all = list(outputs.hidden_states)
     if num_layers > 0 and len(hs_all) == (num_layers + 2):
-        hs_all = hs_all[: (num_layers + 1)]
+        hs_all = hs_all[: (num_layers + 1)]  # drop post-stack norm if present
 
     hidden_layers = list(hs_all[1:])  # block outputs only
 
-    # ---- MoE routing metrics ----
+    # ---- MoE routing metrics (optional) ----
     per_layer_moe_routing_entropy = None
     per_layer_moe_top_expert_ids = None
 
-    moe_decode_trace = getattr(tracer, "moe_decode_trace", None) or {}
-
-    if moe_decode_trace:
-        per_layer_moe_routing_entropy = []
-        per_layer_moe_top_expert_ids = []
-
-        for layer_idx in sorted(moe_decode_trace.keys()):
-            layer_trace = moe_decode_trace[layer_idx]
-            entropies = layer_trace.get("entropy", []) or []
-            top1_ids = layer_trace.get("top1", []) or []
-
-            if entropies:
-                per_layer_moe_routing_entropy.append(float(statistics.fmean(entropies)))
-            else:
-                per_layer_moe_routing_entropy.append(0.0)
-
-            per_layer_moe_top_expert_ids.append([int(x) for x in top1_ids])
-
-        gen_params["moe_trace_source"] = "decode"
-        gen_params["moe_decode_steps"] = int(
-            max((len(v.get("entropy", []) or []) for v in moe_decode_trace.values()), default=0)
-        )
-
-    elif moe_gate_snapshot:
+    if moe_gate_snapshot:
         per_layer_moe_routing_entropy = []
         per_layer_moe_top_expert_ids = []
 
@@ -2745,15 +2817,8 @@ def compute_tension_for_prompt(
             top1_indices = indices[..., 0]
             per_layer_moe_top_expert_ids.append(top1_indices.view(-1).tolist())
 
-        gen_params["moe_trace_source"] = "prompt"
-        gen_params["moe_decode_steps"] = 0
-    else:
-        gen_params["moe_trace_source"] = None
-        gen_params["moe_decode_steps"] = 0
-
     tracer.remove()
 
-    # ====================== Delta computations (unchanged) ======================
     mean_deltas_per_layer_rms = []
     mean_deltas_per_layer_abs = []
     median_deltas_per_layer_rms = []
@@ -2804,9 +2869,10 @@ def compute_tension_for_prompt(
         tail_ratios_per_layer_abs.append(float(mean_abs / (p95_abs + eps)))
         tail_ratios_per_layer_rms.append(float(mean_rms / (p95_rms + eps)))
 
-    mean_deltas_per_layer = mean_deltas_per_layer_rms  # your primary series
+    # Primary series (per-dim RMS)
+    mean_deltas_per_layer = mean_deltas_per_layer_rms
 
-    # Store raw stats in gen_params (unchanged)
+    # Store BOTH full raw lists (for auditing) and core stats (excluding final layer)
     gen_params["per_layer_mean_delta_abs"] = mean_deltas_per_layer_abs
     gen_params["per_layer_median_delta_abs"] = median_deltas_per_layer_abs
     gen_params["per_layer_p95_delta_abs"] = p95_deltas_per_layer_abs
@@ -2816,10 +2882,10 @@ def compute_tension_for_prompt(
     gen_params["per_layer_p95_delta"] = p95_deltas_per_layer_rms
     gen_params["per_layer_tail_ratio"] = tail_ratios_per_layer_rms
 
-    # Exclude final layer from core summary statistics when possible.
-    core_vals = mean_deltas_per_layer[:-1] if len(mean_deltas_per_layer) > 1 else mean_deltas_per_layer[:]
-
-    if core_vals:
+    # === OPTION 1: Exclude final layer (31) from all core summary statistics ===
+    # This removes the systematic Mistral-7B final-block spike.
+    if mean_deltas_per_layer:
+        core_vals = mean_deltas_per_layer[:-1]  # exclude layer 31
         mean_layer_delta = float(sum(core_vals) / len(core_vals))
         max_layer_delta = float(max(core_vals))
     else:
@@ -2827,14 +2893,16 @@ def compute_tension_for_prompt(
         max_layer_delta = 0.0
 
     # Spike ratio also computed on core layers only
-    EXCLUDE_SPIKE_LAYERS = {num_layers - 1} if num_layers > 0 and len(mean_deltas_per_layer) > 1 else set()
+    EXCLUDE_SPIKE_LAYERS = (
+        {num_layers - 1} if num_layers > 0 else set()
+    )  # final layer only
     spike_layer_idx = None
     spike_ratio = None
 
-    if core_vals:
+    if core_vals:  # core_vals already excludes layer 31
         med = float(torch.tensor(core_vals).median().item())
         mx = float(max(core_vals))
-        spike_layer_idx = int(core_vals.index(mx))
+        spike_layer_idx = int(core_vals.index(mx))  # index within core list
         spike_ratio = (mx / (med + 1e-9)) if med > 0 else None
 
     gen_params["delta_spike_transition_idx"] = spike_layer_idx
@@ -2846,10 +2914,9 @@ def compute_tension_for_prompt(
     # Extra: max delta excluding known tail spike (already handled by core_vals)
     gen_params["max_layer_delta_ex_tail"] = float(max_layer_delta)
 
-    # ====================== Curvature, Head Conflict, Entropy (unchanged) ======================
+    # ---- Curvature / Head conflict / Entropy (unchanged) ----
     curvature_per_layer = compute_curvature_from_hidden(hidden_layers)
     curv_vals = [float(x) for x in curvature_per_layer if x is not None]
-    # ... existing curvature / head_conflict / logit_entropy code ...
 
     mean_curvature = float(sum(curv_vals) / len(curv_vals)) if curv_vals else 0.0
     max_curvature = float(max(curv_vals)) if curv_vals else 0.0
@@ -2876,7 +2943,6 @@ def compute_tension_for_prompt(
     mean_logit_entropy = float(sum(entropies) / len(entropies)) if entropies else 0.0
     final_token_entropy = float(entropies[-1]) if entropies else 0.0
 
-    # ====================== Build TensionMetrics ======================
     m = TensionMetrics(
         prompt=prompt,
         label=label,
@@ -2897,26 +2963,12 @@ def compute_tension_for_prompt(
         per_layer_moe_routing_entropy=per_layer_moe_routing_entropy,
         per_layer_moe_top_expert_ids=per_layer_moe_top_expert_ids,
         num_experts=num_experts,
-        moe_step_stats=dict(getattr(tracer, "moe_step_stats", {}) or {}),
-
-        # === NEW: KV Cache Telemetry ===
-        kv_norm_drift_history=getattr(tracer, "kv_norm_drift_history", [])[:],
-        kv_coherence_history=getattr(tracer, "kv_coherence_history", [])[:],
-        kv_mean_norm_history=getattr(tracer, "kv_mean_norm_history", [])[:],
     )
 
-    # Existing band series
-    if 'telemetry_bands' in locals():
+    if "moe_step_stats" in locals():
+        m.moe_step_stats = moe_step_stats
+    if "telemetry_bands" in locals():
         m.telemetry_bands_series = telemetry_bands
-
-    # Copy attention features (you already had these)
-    m.attention_entropy_per_layer = getattr(tracer, "attention_entropy_per_layer", [])[:]
-    m.attention_drift_history = getattr(tracer, "attention_drift_history", [])[:]
-    m.kv_reuse_scores = getattr(tracer, "kv_reuse_scores", [])[:]
-    m.head_specialization = getattr(tracer, "head_specialization", [])[:]
-
-    torch.cuda.empty_cache()
-    gc.collect()
 
     return m
 
@@ -2924,6 +2976,13 @@ def compute_tension_for_prompt(
 # -----------------------------
 #  Experiment prompts
 # -----------------------------
+
+BASELINE_PROMPTS = [
+    "Rewrite the following text in all lowercase: THE QUICK BROWN FOX",
+    "What is 17 + 25?",
+    "Extract the second word from the sentence: “Red apples fall quickly.”",
+    "Complete the sequence: 2, 4, 6, 8, __",
+]
 
 CLASS_A_PROMPTS = [
     "What is the capital of France?",
@@ -3029,11 +3088,13 @@ def summarize_group(metrics: List["TensionMetrics"], name: str) -> None:
 def main():
     global NOESIS_EXPERIMENT_ID
     if not NOESIS_EXPERIMENT_ID:
+        # keep NULL for ad-hoc runs unless nt grouping; set env NOESIS_EXPERIMENT_ID
         NOESIS_EXPERIMENT_ID = None
 
     # -------------------------------
-    # 0) Resolve prompt pack
+    # 0) Resolve prompt pack (IN MAIN)
     # -------------------------------
+
     trace_dir = os.environ.get("NOESIS_TRACE_DIR", "traces")
     os.makedirs(trace_dir, exist_ok=True)
 
@@ -3053,22 +3114,30 @@ def main():
         blob = _load_prompt_pack(prompt_pack_path)
         prompt_pack_name = blob.get("name", os.path.basename(prompt_pack_path))
 
+        # Supported formats:
+        # (A) {"prompts": [...]}  -> treated as a single list under class_a unless "by_class" exists
+        # (B) {"by_class": {"class_a": [...], "class_b": [...]}}
         by_class = blob.get("by_class")
         if by_class and isinstance(by_class, dict):
             class_a_prompts = by_class.get("class_a", [])
             class_b_prompts = by_class.get("class_b", [])
         else:
+            # If only "prompts" is provided, treat as class_a by default.
             prompts = blob.get("prompts", [])
             class_a_prompts = prompts
             class_b_prompts = []
 
         print(f"[Noesis] Using prompt pack: {prompt_pack_name} ({prompt_pack_path})")
-        print(f"[Noesis] Prompt counts: class_a={len(class_a_prompts)} class_b={len(class_b_prompts)}")
+        print(
+            f"[Noesis] Prompt counts: class_a={len(class_a_prompts)} "
+            f"class_b={len(class_b_prompts)}"
+        )
     else:
         class_a_prompts = CLASS_A_PROMPTS
         class_b_prompts = CLASS_B_PROMPTS
-        print("[Noesis] Using builtin prompt lists A/B.")
+        print("[Noesis] Using builtin prompt lists A/B).")
 
+    # Apply MAX_CLASS_* caps consistently
     if MAX_CLASS_A is not None:
         class_a_prompts = class_a_prompts[:MAX_CLASS_A]
     if MAX_CLASS_B is not None:
@@ -3081,31 +3150,37 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(NOESIS_MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
         NOESIS_MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype="auto",
-        device_map="auto" if DEVICE == "cuda" else None,
+        #   trust_remote_code=False,
+        dtype="auto",
+        device_map="cuda",
     )
 
-    tracer = TensionTracer(model)
-    tracer.register(layer_stride=LAYER_STRIDE)
+    # Make sure attention is eager for attentions
+    if USE_ATTENTIONS:
+        try:
+            model.set_attn_implementation("eager")
+            print(
+                "Attention mode set to 'eager' (required for reliable output_attentions=True)"
+            )
+        except Exception as e:
+            print(f"Warning: Could not set attn_implementation to 'eager': {e}")
 
-#    all_metrics = []
+    tracer = TensionTracer(model)
     tracer.enable_moe_tracing(top_k=2)
 
     all_metrics: List[TensionMetrics] = []
 
     # -------------------------------
-    # 2) Run prompts + immediate trace saving
+    # 2) Run all prompts and collect metrics (unified loop)
     # -------------------------------
     runspec = [
         ("class_a", class_a_prompts, "CLASS_A", False),
-        ("class_b", class_b_prompts, "CLASS_B", True),
+        ("class_b", class_b_prompts, "CLASS_B", True),  # print response
     ]
 
     for label, prompts, banner, print_response in runspec:
         for idx, p in enumerate(prompts):
             print(f"\n[{banner}] {p}")
-
             m = compute_tension_for_prompt(
                 model,
                 tokenizer,
@@ -3120,35 +3195,19 @@ def main():
                 seed=NOESIS_SEED,
             )
             all_metrics.append(m)
-
-            # === IMMEDIATE TRACE (first pass - no full HTI yet) ===
-            notes = f"{label}_prompt_{idx:02d} :: prompt_pack={prompt_pack_name}"
-            trace = build_trace_from_metrics(
-                metrics=m,
-                model=model,
-                tokenizer=tokenizer,
-                prompt=m.prompt,
-                label=label,
-                run_id=None,
-                notes=notes,
-                hti_stats_v2=None,           # first pass - no calibration yet
-                regime_baseline=None,
-            )
-
-            out_name = f"{label}_{idx:02d}.json"
-            out_path = os.path.join(trace_dir, out_name)
-            save_trace(trace, out_path)
-            print(f"Saved trace (first pass) -> {out_path}")
-
+            print(asdict(m))
             if print_response:
                 print(f"RESPONSE:\n{m.response_text}\n")
 
-            # Aggressive cleanup after every prompt
-            torch.cuda.empty_cache()
-            gc.collect()
+    # Grouping for summaries
+    class_a = [m for m in all_metrics if m.label == "class_a"]
+    class_b = [m for m in all_metrics if m.label == "class_b"]
+
+    summarize_group(class_a, "CLASS_A")
+    summarize_group(class_b, "CLASS_B")
 
     # -------------------------------
-    # 3) HTI v0.2 calibration (after all prompts)
+    # 3) HTI v0.2 calibration + baseline bundle for regime inference
     # -------------------------------
     stats_v2 = compute_hti_calibration_v2(all_metrics)
 
@@ -3161,9 +3220,17 @@ def main():
             sd = 1.0
         return mu, sd
 
-    class_a_htis = [compute_hti_v2_for_metric(m, stats_v2) for m in all_metrics if m.label == "class_a"]
-    class_a_tensions = [h["tension_index"] for h in class_a_htis if h.get("tension_index") is not None]
-    class_a_drifts = [h["drift_index"] for h in class_a_htis if h.get("drift_index") is not None]
+    class_a_htis = [
+        compute_hti_v2_for_metric(m, stats_v2)
+        for m in all_metrics
+        if m.label == "class_a"
+    ]
+    class_a_tensions = [
+        h["tension_index"] for h in class_a_htis if h.get("tension_index") is not None
+    ]
+    class_a_drifts = [
+        h["drift_index"] for h in class_a_htis if h.get("drift_index") is not None
+    ]
 
     t_mu, t_sd = _mu_sigma(class_a_tensions)
     d_mu, d_sd = _mu_sigma(class_a_drifts)
@@ -3178,12 +3245,17 @@ def main():
     print("\n=== HTI v0.2 (Tension vs Drift) ===")
     for m in all_metrics:
         h = compute_hti_v2_for_metric(m, stats_v2)
-        print(f"[{m.label.upper()}] tension={h['tension_index']:.3f}  drift/HTI={h['drift_index']:.3f}")
+        print(
+            f"[{m.label.upper()}] "
+            f"tension={h['tension_index']:.3f}  "
+            f"drift/HTI={h['drift_index']:.3f}  "
+        )
 
     # -------------------------------
-    # 4) Second pass: rebuild traces with full stats
+    # 4) Build traces with HTI v0.2 baked in
     # -------------------------------
-    print("\nRebuilding traces with full HTI / regime stats...")
+
+    # Keep per-label indices stable
     label_counts = {"class_a": 0, "class_b": 0}
 
     for m in all_metrics:
@@ -3191,7 +3263,7 @@ def main():
         idx = label_counts.get(label, 0)
         label_counts[label] = idx + 1
 
-        notes = f"{label}_prompt_{idx:02d} :: prompt_pack={prompt_pack_name}"
+        notes = f"{label}_prompt_{idx} :: prompt_pack={prompt_pack_name}"
 
         trace = build_trace_from_metrics(
             metrics=m,
@@ -3208,14 +3280,16 @@ def main():
         out_name = f"{label}_{idx:02d}.json"
         out_path = os.path.join(trace_dir, out_name)
         save_trace(trace, out_path)
-        print(f"Updated trace with full stats -> {out_path}")
+        print(f"Saved trace -> {out_path}")
 
-        torch.cuda.empty_cache()
-        gc.collect()
+    # Memory cleanup between prompts
+    torch.cuda.empty_cache()
+    gc.collect()
 
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        allocated = torch.cuda.memory_allocated() / (1024**3)
         print(f"[memory] After prompt {idx:05d}: {allocated:.2f} GB")
+
     results_path = os.path.join(metrics_dir, "tension_results.json")
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump([asdict(m) for m in all_metrics], f, indent=2)
