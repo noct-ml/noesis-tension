@@ -2,9 +2,46 @@
 
 **Telemetry-driven taxonomy of prompt-induced representational pressures in large language models.**
 
-### Current Stable Release
+### Change Log — 2026/05/07
 
-**v3.0-stable** (April 2026) — This is the version referenced in the preprint.
+```text
+telemetry-v0.3.2
+
+- Added KV cache telemetry:
+  - norm drift history
+  - rolling coherence history
+  - mean norm history
+  - final/max drift summaries
+
+- Updated cognitive regime inference:
+  - classifies with HTI + Noesis profile + KV stability/instability
+  - uses final KV drift, recent drift, coherence, and norm trend
+  - improves symbolic_repetitive_drift, safety_procedural, and liminal_drift separation
+
+- Cleaned decode loop:
+  - removed micro-shock intervention references from decode_with_band_capture
+  - kept per-token entropy/confidence/margin and band telemetry
+  - captures KV drift directly from returned past_key_values
+
+- Improved MoE telemetry:
+  - added decode-time MoE routing trace
+  - canonical MoE metrics now prefer generated-response routing
+  - prompt-forward MoE snapshot remains fallback
+
+- Trace output expanded:
+  - extras.kv_cache added
+  - summary KV fields added
+  - regime feature bundles now include KV diagnostics
+  - gen_params records MoE trace source and decode step count
+
+- Fixed:
+  - spike ratio now read from metrics.gen_params
+  - removed fragile KV cache block hook path
+  - prevented prompt-forward-only MoE routing from being treated as response routing
+```
+
+
+### **v3.0-stable** (April 2026) — Initial release.
 
 → [v3.0-stable/](v3.0-stable/) (Clean A/B prompt classes, telemetry-only classifier)
 
@@ -89,3 +126,5 @@ Traces are saved to ./traces/ and a summary JSON to ./metrics/tension_results.js
 ### Acknowledgments
 
 Special thanks to the reverse engineering community and former colleagues (especially those from the Fyyre era) who helped shape the low-level thinking behind Noesis Tension.
+
+
