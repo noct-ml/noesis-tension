@@ -41,9 +41,9 @@ telemetry-v0.3.2
 ```
 
 
-### **v3.0-stable** (April 2026) — Initial release.
+### **v0.3.2** (May 2026) — Update Three
 
-→ [v3.0-stable/](v3.0-stable/) (Clean A/B prompt classes, telemetry-only classifier)
+→ [v0.3.2/](v0.3.2/) (Clean A/B prompt classes, telemetry-only classifier)
 
 ### Requirements
 
