@@ -182,3 +182,6 @@ cython_debug/
 /v0.3.2/traces
 /v3.0-stable/traces
 /v3.0-stable/traces
+/traces
+/v3.0-stable/traces
+/v3.0-stable/traces/llama_3_1_8B_final

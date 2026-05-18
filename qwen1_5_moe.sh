@@ -2,13 +2,15 @@
 set -euo pipefail
 
 # ---- Hygiene Battery (Margin-first) ----
-export NOESIS_EXPERIMENT_ID="llama_3_1_8B_final"
+export NOESIS_EXPERIMENT_ID="Qwen1_5_MoE"
 export NOESIS_PROMPT_FILE="./prompts/sample_prompts.json"
+
+export NOESIS_MAX_NEW_TOKENS=64
 
 TRACE_ROOT="./traces"
 METRICS_ROOT="./metrics"
 
-export NOESIS_USE_ATTENTIONS=0
+export NOESIS_USE_ATTENTIONS=1
 
 # First pass: run once everywhere
 K1=1
@@ -18,9 +20,9 @@ K2=3
 BASE_SEED=40001
 
 # Models
-NOESIS_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+NOESIS_MODEL_NAME="Qwen/Qwen1.5-MoE-A2.7B"
 MODELS=(
-   "meta-llama/Llama-3.1-8B-Instruct"
+   "Qwen/Qwen1.5-MoE-A2.7B"
 )
 
 # Token windows (fast + clean for margin sanity)
@@ -30,7 +32,7 @@ WINDOWS=(64 128)
 COND_NAMES=("greedy" "t03" "t08" "t11")
 
 # Thresholds for selecting "unstable" prompts from traces:
-# We promote any prompt that yielded margin_bucket == boundary or collapsed.
+# We promote any prompt that yielded margin_bucket == boundary or indeterminate (formally 'collapsed'.)
 UNSTABLE_BUCKETS=("boundary" "indeterminate")
 
 model_tag_of () {
@@ -95,17 +97,17 @@ run_one () {
   rm -f "${NOESIS_TRACE_DIR}"/*.json 2>/dev/null || true
   rm -f "${NOESIS_METRICS_DIR}"/*.json 2>/dev/null || true
 
-  echo "== HYGIENE model=${model} w=${max_new_tokens} cond=${cond} rep=${rep} seed=${NOESIS_SEED} temp=${NOESIS_TEMPERATURE} top_p=${NOESIS_TOP_P} do_sample=${NOESIS_DO_SAMPLE} =="
+  echo "== model=${model} w=${max_new_tokens} cond=${cond} rep=${rep} seed=${NOESIS_SEED} temp=${NOESIS_TEMPERATURE} top_p=${NOESIS_TOP_P} do_sample=${NOESIS_DO_SAMPLE} =="
 
   # Run with per-invocation overrides (correct)
   NOESIS_MODEL_NAME="$model" \
   NOESIS_MAX_NEW_TOKENS="$max_new_tokens" \
-  python noesis_current_v4.py
+  python noesis_current.py
 
   local nfiles
   nfiles=$(ls -1 "${NOESIS_TRACE_DIR}"/*.json 2>/dev/null | wc -l | tr -d " ")
   echo "Trace files: ${nfiles}"
-
+  exit 1
   if [ "$nfiles" -eq 0 ]; then
     echo "ERROR: No traces produced in ${NOESIS_TRACE_DIR}" >&2
     exit 1
@@ -201,7 +203,7 @@ PY
 # (still acceptable because suite is small).
 supports_prompt_filtering () {
   # Heuristic: if the code reads NOESIS_PROMPT_FILTER_IDS / TEXTS, it supports it.
-  # We won't introspect file here; assume "no" unless you tell me otherwise.
+  # We won't introspect file here; assume "no" unless updated.
   return 1
 }
 

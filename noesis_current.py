@@ -1,6 +1,7 @@
 """
-- Noesis Tension Classifier — v0.3.2
+- Noesis Tension Classifier — v0.3.3
 - Author: James (noct-ml)
+- Last Update: 2026/05/18 — 23:14 UTC
 """
 
 import os
@@ -24,7 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 #  Config
 # -----------------------------
 
-NOESIS_VERSION = "0.3.2"
+NOESIS_VERSION = "0.3.3"
 
 NOESIS_BASELINE_ID = os.environ.get("NOESIS_BASELINE_ID")
 
@@ -41,9 +42,10 @@ NOESIS_MODEL_NAME = os.environ.get(
 NOESIS_MAX_NEW_TOKENS = int(os.environ.get("NOESIS_MAX_NEW_TOKENS", "64"))
 
 # Whether to request full attentions from the model (expensive!)
-USE_ATTENTIONS = True  # set True only when explicitly want head_conflict
+#USE_ATTENTIONS = True  # set True only when explicitly want head_conflict
 
-#USE_ATTENTIONS = os.environ.get("NOESIS_USE_ATTENTIONS", "0") == "1"
+# set this in the shell script (e.g., mistral_35.sh, llama_test.sh, etc..)
+USE_ATTENTIONS = os.environ.get("NOESIS_USE_ATTENTIONS", "0") == "1"
 
 # Only hook / sample every Nth layer for deltas & curvature
 LAYER_STRIDE = 1  # 1 = all layers, 2 = every other, 3 = every third, etc.
@@ -101,7 +103,7 @@ def safe_fmean(data, default: float = 0.0) -> float:
 # -----------------------------
 
 # Increment when telemetry-only classification logic changes in a way that affects comparability.
-CLASSIFIER_VERSION = "telemetry-v0.3.2"
+CLASSIFIER_VERSION = "telemetry-v0.3.3"
 
 # Optional baseline pack path (set via env var). If not present, MoE ED baseline is disabled.
 NOESIS_BASELINE_PATH = os.environ.get(
@@ -383,6 +385,65 @@ class RegimeProbe:
         if getattr(self, "risk_hold", 0) > 0:
             self.risk_hold -= 1
 
+
+@dataclass(frozen=True)
+class RegimeConfig:
+    tension_hi: Tuple[float, float] = (0.55, 0.80)
+    drift_hi: Tuple[float, float] = (0.55, 0.75)
+    moral_paradox_band: Tuple[float, float] = (0.18, 0.35)
+    false_presup_band: Tuple[float, float] = (0.15, 0.30)
+    symbolic_band: Tuple[float, float] = (0.08, 0.20)
+    kv_stable_band: Tuple[float, float] = (0.55, 0.80)
+    kv_unstable_band: Tuple[float, float] = (0.40, 0.70)
+    min_kv_tokens: int = 6
+    version: str = "regime-v0.4"
+
+
+@dataclass(frozen=True)
+class RegimeFeatures:
+    # Macro indices
+    tension: float
+    drift: float
+    spike_ratio: float
+
+    # Noesis category vector signals
+    moral_paradox: float
+    false_presupposition: float
+    symbolism: float
+    ambiguous_containment: float
+    paradox_pressure: float
+    symbolic_score: float          # = max(symbolism, ambiguous_containment, aesthetic_logic)
+
+    # KV cache derived
+    kv_stability: float
+    kv_instability: float
+    kv_norm_trend: float
+    kv_reliable: bool
+    kv_accumulating: bool
+    kv_late_jump: bool
+    kv_spiky: bool
+
+    # Entropy / attention
+    low_entropy: bool
+    entropy_sustained: bool
+    mean_attn_drift: float
+    mean_kv_reuse: float
+
+    # Baseline / policy
+    in_factual_control_band: bool
+    is_safety_liminal: bool
+    label: Optional[str]           # e.g. "class_a"
+
+    # Diagnostics (carried through to the output features dict)
+    kv_recent_drift: float
+    kv_final_drift: float
+    kv_max_drift: float
+    kv_recent_coherence: float
+    kv_num_tokens: int
+
+
+REGIME_CONFIG: RegimeConfig = RegimeConfig()
+
 # -----------------------------
 #  Noesis Neuro-Ontological Categories (v1)
 # -----------------------------
@@ -593,7 +654,7 @@ class TensionTracer:
         return hook
 
     def _capture_kv_drift(self, past_kv):
-        """Core KV telemetry: norm drift + coherence."""
+        """Core KV telemetry: norm drift and coherence."""
         if past_kv is None:
             return
 
@@ -736,6 +797,7 @@ class TensionTracer:
                 pass
         self._hooks = []
         self.attention_maps.clear()
+        self._moe_patched = False
 
     def clear(self):
         self.hidden_by_layer = []
@@ -818,7 +880,7 @@ class TensionTracer:
         self.capture_mode = "step"
         self.step_layer_scalar = [None] * self.num_layers_total
 
-        # Reset per-step MoE accumulators used for cheap routing stats.
+        # Reset per-step MoE accumulators used for routing stats.
         self._moe_step_acc = {
             "n": 0,
             "entropy_sum": 0.0,
@@ -909,13 +971,6 @@ class TensionTracer:
             "routing_top1_mode_frac": float(mode_frac),
         }
 
-    def configure_moe_diversification(
-        self, *, gate_noise_sigma: float = 0.0, gate_bias_strength: float = 0.0
-    ):
-        # Only takes effect if MoE tracing/patching is enabled.
-        self.moe_gate_noise_sigma = float(gate_noise_sigma)
-        self.moe_gate_bias_strength = float(gate_bias_strength)
-
     def enable_moe_tracing(self, top_k: int = 2):
         """
         Patch MoE blocks (if present) to capture gate logits and selected experts.
@@ -965,7 +1020,7 @@ class TensionTracer:
                                 else:
                                     gate_logits[:, top1] = gate_logits[:, top1] - bias
 
-                    # --- Cheap per-token routing stats + decode-time aggregate trace ---
+                    # --- per-token routing stats + decode-time aggregate trace ---
                     try:
                         with torch.no_grad():
                             gl_last = (
@@ -1064,7 +1119,7 @@ def compute_moe_anomaly(
       moe_entropies:
         - list of per-layer routing entropies (same order as MoE layers)
       num_experts:
-        - total expert count for this model (e.g. 60 for Qwen1.5-MoE-A2.7B)
+        - total expert count for this model (e.g., 60 for Qwen1.5-MoE-A2.7B)
       tension_index, drift_index:
         - from HTI v0.2 (tension, drift); can be None
       baseline_moe_stats (optional):
@@ -1233,6 +1288,244 @@ def compute_moe_anomaly(
         },
     }
 
+def _band_for_layer(i: int, n: int) -> str:
+    if n <= 1:
+        return "early"
+    a, b = n // 3, (2 * n) // 3
+    if i < a:
+        return "early"
+    if i < b:
+        return "mid"
+    return "late"
+
+
+def _safe_indexed(seq, i: int):
+    if seq is None or i >= len(seq):
+        return None
+    return seq[i]
+
+
+def _build_model_info(model) -> Dict[str, Any]:
+    config = model.config
+    first_param = next(model.parameters())
+    return {
+        "name": getattr(config, "_name_or_path", None) or getattr(model, "name_or_path", None),
+        "revision": None,
+        "dtype": str(first_param.dtype),
+        "device": str(first_param.device),
+        "num_layers": getattr(config, "num_hidden_layers", None),
+        "hidden_size": getattr(config, "hidden_size", None),
+        "num_heads": getattr(config, "num_attention_heads", None),
+    }
+
+
+def _generate_run_id(prompt: str, label: str) -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
+    return f"{timestamp}_{label}_{prompt_hash}"
+
+
+def _build_run_info(
+    *,
+    run_id: str,
+    label: str,
+    prompt: str,
+    response_text: Optional[str],
+    notes: Optional[str],
+    metrics: TensionMetrics,
+    baseline_id: Optional[str],
+) -> Dict[str, Any]:
+    gen_params = metrics.gen_params or {}
+    run_info: Dict[str, Any] = {
+        "id": run_id,
+        "classifier_version": CLASSIFIER_VERSION,
+        "baseline_id": baseline_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "label": label,
+        "prompt": prompt,
+        "response": response_text,
+        "max_new_tokens": gen_params.get("max_new_tokens"),
+        # may differ from telemetry_bands.series.generated_token_count if warm-start skipped
+        "gen_tokens": getattr(metrics, "gen_tokens", None),
+        "do_sample": gen_params.get("do_sample"),
+        "temperature": gen_params.get("temperature"),
+        "top_p": gen_params.get("top_p"),
+        "pad_token_id": gen_params.get("pad_token_id"),
+        "seed": gen_params.get("seed"),
+        "notes": notes,
+        "experiment_id": gen_params.get("experiment_id"),
+        "prompt_id": gen_params.get("prompt_id"),
+    }
+    if isinstance(metrics.gen_params, dict):
+        run_info["gen_params"] = metrics.gen_params
+    return run_info
+
+
+def _build_tokens_info(tokenizer, prompt: str) -> Dict[str, Any]:
+    encoded = tokenizer(prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"][0].tolist()
+    token_strings = [tokenizer.decode([tid]) for tid in input_ids]
+    return {
+        "input_ids": input_ids,
+        "token_strings": token_strings,
+        "token_count": len(input_ids),
+    }
+
+
+def _compute_hti(metrics: TensionMetrics, hti_stats_v2: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if hti_stats_v2 is None:
+        return {"tension_index": None, "drift_index": None}
+    return compute_hti_v2_for_metric(metrics, hti_stats_v2)
+
+
+def _find_max_delta_index(metrics: TensionMetrics) -> Optional[int]:
+    try:
+        return metrics.per_layer_mean_delta.index(metrics.max_layer_delta)
+    except Exception:
+        return None
+
+
+def _build_kv_features(metrics: TensionMetrics) -> Dict[str, Any]:
+    kv_drift_hist = getattr(metrics, "kv_norm_drift_history", None) or []
+    kv_coherence_hist = getattr(metrics, "kv_coherence_history", None) or []
+    kv_mean_norm_hist = getattr(metrics, "kv_mean_norm_history", None) or []
+    return {
+        "kv_norm_drift_history": kv_drift_hist,
+        "kv_coherence_history": kv_coherence_hist,
+        "kv_mean_norm_history": kv_mean_norm_hist,
+        "kv_final_drift": float(kv_drift_hist[-1]) if kv_drift_hist else 0.0,
+        "kv_mean_coherence": float(statistics.fmean(kv_coherence_hist)) if kv_coherence_hist else 0.75,
+        "kv_max_drift": float(max(kv_drift_hist)) if kv_drift_hist else 0.0,
+        "kv_num_tokens": len(kv_drift_hist),
+    }
+
+
+def _resolve_num_layers(model, metrics: TensionMetrics) -> int:
+    return (
+        getattr(model.config, "num_hidden_layers", None)
+        or len(getattr(metrics, "per_layer_head_conflict", []) or [])
+        or (len(metrics.per_layer_mean_delta) + 1)
+    )
+
+
+def _build_layer_extra(i: int, num_layers: int, gen_params: Dict[str, Any]) -> Dict[str, Any]:
+    extra: Dict[str, Any] = {"band": _band_for_layer(i, num_layers)}
+    for out_key, source_key in (
+        ("median_delta", "per_layer_median_delta"),
+        ("p95_delta", "per_layer_p95_delta"),
+        ("tail_ratio", "per_layer_tail_ratio"),
+    ):
+        source = gen_params.get(source_key)
+        if isinstance(source, list) and i < len(source):
+            extra[out_key] = float(source[i])
+    return extra
+
+
+def _build_layers(metrics: TensionMetrics, num_layers: int) -> List[LayerMetrics]:
+    gen_params = metrics.gen_params or {}
+    curvature_seq = getattr(metrics, "per_layer_curvature", None)
+    layers: List[LayerMetrics] = []
+    for i in range(num_layers):
+        layers.append(
+            LayerMetrics(
+                index=i,
+                mean_delta=_safe_indexed(metrics.per_layer_mean_delta, i),
+                head_conflict=_safe_indexed(metrics.per_layer_head_conflict, i),
+                curvature=_safe_indexed(curvature_seq, i),
+                extra=_build_layer_extra(i, num_layers, gen_params),
+            )
+        )
+    return layers
+
+
+def _attach_band_series(telemetry_bands: Dict[str, Any], metrics: TensionMetrics, ranges: Dict[str, List[int]]) -> None:
+    series = getattr(metrics, "telemetry_bands_series", None)
+    if not isinstance(series, dict):
+        return
+    try:
+        gen_n = int(series.get("generated_token_count", 0))
+        zE = series.get("z_early", [])
+        zM = series.get("z_mid", [])
+        zL = series.get("z_late", [])
+        if not (gen_n >= 0 and len(zE) == len(zM) == len(zL) == gen_n):
+            return
+
+        out: Dict[str, Any] = {
+            "generated_token_count": gen_n,
+            "z_early": list(map(float, zE)),
+            "z_mid": list(map(float, zM)),
+            "z_late": list(map(float, zL)),
+            "ranges": series.get("ranges", ranges),
+            "z_mode": series.get("z_mode", "unknown"),
+        }
+        entropy_mean = series.get("entropy_mean")
+        if isinstance(entropy_mean, list) and len(entropy_mean) == gen_n:
+            out["entropy_mean"] = list(map(float, entropy_mean))
+        telemetry_bands["series"] = out
+    except Exception:
+        # omit series if malformed
+        pass
+
+
+def _resolve_num_experts(metrics: TensionMetrics, model) -> Optional[int]:
+    num_experts = getattr(metrics, "num_experts", None)
+    if num_experts is None and hasattr(model, "tension_tracer"):
+        num_experts = getattr(model.tension_tracer, "moe_num_experts", None)
+    return num_experts
+
+
+def _build_moe_summary(
+    metrics: TensionMetrics,
+    model,
+    tension_val: Optional[float],
+    drift_val: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    moe_entropies = metrics.per_layer_moe_routing_entropy
+    if moe_entropies is None:
+        return None
+
+    moe_mean = float(sum(moe_entropies) / len(moe_entropies)) if moe_entropies else None
+    moe_max = float(max(moe_entropies)) if moe_entropies else None
+    num_experts = _resolve_num_experts(metrics, model)
+
+    moe_anom = compute_moe_anomaly(
+        metrics=metrics,
+        moe_entropies=moe_entropies,
+        num_experts=num_experts,
+        tension_index=tension_val,
+        drift_index=drift_val,
+        baseline_moe_stats=get_baseline_moe_stats(),
+    )
+    return {
+        "mean_routing_entropy": moe_mean,
+        "max_routing_entropy": moe_max,
+        "num_experts": num_experts,
+        "anomaly": moe_anom,
+    }
+
+
+def _build_moe_extras(
+    metrics: TensionMetrics,
+    model,
+    tension_val: Optional[float],
+    drift_val: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    moe_entropies = metrics.per_layer_moe_routing_entropy
+    if moe_entropies is None:
+        return None
+
+    moe_layers: List[Dict[str, Any]] = []
+    top_ids = metrics.per_layer_moe_top_expert_ids
+    for idx, ent in enumerate(moe_entropies):
+        layer_entry: Dict[str, Any] = {"index": idx, "routing_entropy": float(ent)}
+        if top_ids is not None and idx < len(top_ids):
+            layer_entry["top_expert_ids"] = top_ids[idx]
+        moe_layers.append(layer_entry)
+
+    summary = _build_moe_summary(metrics, model, tension_val, drift_val)
+    return {"layers": moe_layers, "summary": summary}
+
+
 def build_trace_from_metrics(
     metrics: TensionMetrics,
     model,
@@ -1244,33 +1537,18 @@ def build_trace_from_metrics(
     hti_stats_v2: Optional[Dict[str, Any]] = None,
     regime_baseline: Optional[Dict[str, float]] = None,
 ) -> Trace:
-    # Model metadata
-    config = model.config
-    model_info = {
-        "name": getattr(config, "_name_or_path", None)
-        or getattr(model, "name_or_path", None),
-        "revision": None,
-        "dtype": str(next(model.parameters()).dtype),
-        "device": str(next(model.parameters()).device),
-        "num_layers": getattr(config, "num_hidden_layers", None),
-        "hidden_size": getattr(config, "hidden_size", None),
-        "num_heads": getattr(config, "num_attention_heads", None),
-    }
+    gen_params = metrics.gen_params or {}
 
-    # Run metadata
+    model_info = _build_model_info(model)
+
     if run_id is None:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        ph = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]
-        run_id = f"{ts}_{label}_{ph}"
+        run_id = _generate_run_id(prompt, label)
 
     response_text = getattr(metrics, "response_text", None)
-    # text_annotations = annotate_text_patterns(prompt=prompt, response=response_text)
 
     # Determine whether MoE telemetry is present for THIS trace.
     has_moe = metrics.per_layer_moe_routing_entropy is not None
-
     resolved_baseline = NOESIS_BASELINE_ID or get_baseline_id()
-
     # Commitment-collapse fix: MoE requires baseline_id
     if has_moe and not resolved_baseline:
         raise RuntimeError(
@@ -1278,254 +1556,59 @@ def build_trace_from_metrics(
             "Refusing to emit trace (prevents invalid baseline-relative analysis)."
         )
 
-    run_info = {
-        "id": run_id,
-        "classifier_version": CLASSIFIER_VERSION,
-        "baseline_id": (resolved_baseline if has_moe else None),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "label": label,
-        "prompt": prompt,
-        "response": response_text,
-        "max_new_tokens": (metrics.gen_params or {}).get("max_new_tokens"),
-        "gen_tokens": getattr(
-            metrics, "gen_tokens", None
-        ),  # may differ from telemetry_bands.series.generated_token_count if warm-start skipped
-        "do_sample": (metrics.gen_params or {}).get("do_sample"),
-        "temperature": (metrics.gen_params or {}).get("temperature"),
-        "top_p": (metrics.gen_params or {}).get("top_p"),
-        "pad_token_id": (metrics.gen_params or {}).get("pad_token_id"),
-        "seed": (metrics.gen_params or {}).get("seed"),
-        "notes": notes,
-        "experiment_id": (metrics.gen_params or {}).get("experiment_id"),
-        "prompt_id": (metrics.gen_params or {}).get("prompt_id"),
-    }
+    run_info = _build_run_info(
+        run_id=run_id,
+        label=label,
+        prompt=prompt,
+        response_text=response_text,
+        notes=notes,
+        metrics=metrics,
+        baseline_id=(resolved_baseline if has_moe else None),
+    )
 
-    # Attach full generation params blob so ingest/raw_json queries can see diagnostics
-    if isinstance(metrics.gen_params, dict):
-        run_info["gen_params"] = metrics.gen_params
-
-    # Tokens
-    enc = tokenizer(prompt, return_tensors="pt")
-    input_ids = enc["input_ids"][0].tolist()
-    token_strings = [tokenizer.decode([tid]) for tid in input_ids]
-
-    tokens_info = {
-        "input_ids": input_ids,
-        "token_strings": token_strings,
-        "token_count": len(input_ids),
-    }
+    tokens_info = _build_tokens_info(tokenizer, prompt)
 
     # HTI v0.2 if stats provided
-    if hti_stats_v2 is not None:
-        hti = compute_hti_v2_for_metric(metrics, hti_stats_v2)
-        tension_val = hti["tension_index"]
-        drift_val = hti["drift_index"]
-    else:
-        tension_val = None
-        drift_val = None
-        hti = {"tension_index": None, "drift_index": None, "hti_v2": None}
+    hti = _compute_hti(metrics, hti_stats_v2)
+    tension_val = hti["tension_index"]
+    drift_val = hti["drift_index"]
 
-    # --- Safety Liminality Detection -----------------------------------
-    try:
-        idx_max_delta = metrics.per_layer_mean_delta.index(metrics.max_layer_delta)
-    except Exception:
-        idx_max_delta = None
-
+    # Safety Liminality Detection
     is_safety_liminal = classify_safety_liminality(
         metrics=metrics,
-        idx_of_max_delta=idx_max_delta,
+        idx_of_max_delta=_find_max_delta_index(metrics),
         tension=tension_val,
         drift=drift_val,
     )
+    archetype_name = "safety_liminality" if is_safety_liminal else None
 
-    # ====================== ROBUST KV CACHE FEATURES ======================
-    kv_drift_hist = getattr(metrics, "kv_norm_drift_history", None) or []
-    kv_coherence_hist = getattr(metrics, "kv_coherence_history", None) or []
-    kv_mean_norm_hist = getattr(metrics, "kv_mean_norm_history", None) or []
-
-    kv_mean_coherence = float(statistics.fmean(kv_coherence_hist)) if kv_coherence_hist else 0.75
-    kv_max_drift = float(max(kv_drift_hist)) if kv_drift_hist else 0.0
-    kv_final_drift = float(kv_drift_hist[-1]) if kv_drift_hist else 0.0
-    kv_num_tokens = len(kv_drift_hist)
-    if is_safety_liminal:
-        archetype_name = "safety_liminality"
-    else:
-        archetype_name = None
-
-    kv_features = {
-        "kv_norm_drift_history": kv_drift_hist,
-        "kv_coherence_history": kv_coherence_hist,
-        "kv_mean_norm_history": kv_mean_norm_hist,
-        "kv_final_drift": kv_final_drift,
-        "kv_mean_coherence": kv_mean_coherence,
-        "kv_max_drift": kv_max_drift,
-        "kv_num_tokens": kv_num_tokens,
-    }
+    # KV CACHE FEATURES
+    kv_features = _build_kv_features(metrics)
 
     # Layer construction
-    # Per-layer count (declared preferred)
-    num_layers = (
-        getattr(model.config, "num_hidden_layers", None)
-        or len(getattr(metrics, "per_layer_head_conflict", []) or [])
-        or (len(metrics.per_layer_mean_delta) + 1)
-    )
-
-    def _band_ranges(n: int) -> dict:
-        if n <= 1:
-            return {"early": [0, 0], "mid": [0, 0], "late": [0, 0]}
-        a = n // 3
-        b = (2 * n) // 3
-        return {
-            "early": [0, max(0, a - 1)],
-            "mid": [a, max(a, b - 1)],
-            "late": [b, n - 1],
-        }
-
-    def _band_for_layer(i: int, n: int) -> str:
-        if n <= 1:
-            return "early"
-        a = n // 3
-        b = (2 * n) // 3
-        if i < a:
-            return "early"
-        elif i < b:
-            return "mid"
-        else:
-            return "late"
-
-    def _mean(xs):
-        xs = [float(x) for x in xs if x is not None]
-        return (sum(xs) / len(xs)) if xs else None
-
-    # Pull robust per-layer deltas if present (from gen_params)
-    med_deltas = (metrics.gen_params or {}).get("per_layer_median_delta", None)
-    p95_deltas = (metrics.gen_params or {}).get("per_layer_p95_delta", None)
-
-    layers: List[LayerMetrics] = []
-    for i in range(num_layers):
-        mean_delta = (
-            metrics.per_layer_mean_delta[i]
-            if i < len(metrics.per_layer_mean_delta)
-            else None
-        )
-        head_conflict = (
-            metrics.per_layer_head_conflict[i]
-            if i < len(metrics.per_layer_head_conflict)
-            else None
-        )
-
-        curvature = None
-        if getattr(metrics, "per_layer_curvature", None) is not None and i < len(
-            metrics.per_layer_curvature
-        ):
-            curvature = metrics.per_layer_curvature[i]
-
-        band = _band_for_layer(i, num_layers)
-
-        extra = {"band": band}
-
-        # Attach robust deltas per layer (if present)
-        if isinstance(med_deltas, list) and i < len(med_deltas):
-            extra["median_delta"] = float(med_deltas[i])
-        if isinstance(p95_deltas, list) and i < len(p95_deltas):
-            extra["p95_delta"] = float(p95_deltas[i])
-        tail_ratios = (metrics.gen_params or {}).get("per_layer_tail_ratio")
-        if isinstance(tail_ratios, list) and i < len(tail_ratios):
-            extra["tail_ratio"] = float(tail_ratios[i])
-
-        layers.append(
-            LayerMetrics(
-                index=i,
-                mean_delta=mean_delta,
-                head_conflict=head_conflict,
-                curvature=curvature,
-                extra=extra,
-            )
-        )
+    num_layers = _resolve_num_layers(model, metrics)
+    layers = _build_layers(metrics, num_layers)
 
     ranges = _band_ranges(num_layers)
 
-    def _band_layers(bname: str):
-        lo, hi = ranges[bname]
-        return [ly for ly in layers if lo <= ly.index <= hi]
+    def _band_layers(band_name: str) -> List[LayerMetrics]:
+        lo, hi = ranges[band_name]
+        return [layer for layer in layers if lo <= layer.index <= hi]
 
-    telemetry_bands = {"ranges": ranges, "means": {}}
-
-    for bname in ["early", "mid", "late"]:
-        bl = _band_layers(bname)
-        telemetry_bands["means"][bname] = {
-            "mean_delta": _mean([x.mean_delta for x in bl]),
-            "head_conflict": _mean([x.head_conflict for x in bl]),
-            "curvature": _mean([x.curvature for x in bl]),
+    telemetry_bands: Dict[str, Any] = {"ranges": ranges, "means": {}}
+    for band_name in ("early", "mid", "late"):
+        band_layers_list = _band_layers(band_name)
+        telemetry_bands["means"][band_name] = {
+            "mean_delta": _mean([x.mean_delta for x in band_layers_list]),
+            "head_conflict": _mean([x.head_conflict for x in band_layers_list]),
+            "curvature": safe_fmean([x.curvature for x in band_layers_list]),
         }
 
-    # ---- NEW: attach per-token band series (if present) ----
-    series = getattr(metrics, "telemetry_bands_series", None)
-    if isinstance(series, dict):
-        try:
-            gen_n = int(series.get("generated_token_count", 0))
-            zE = series.get("z_early", [])
-            zM = series.get("z_mid", [])
-            zL = series.get("z_late", [])
-            if gen_n >= 0 and len(zE) == len(zM) == len(zL) == gen_n:
-                telemetry_bands["series"] = {
-                    "generated_token_count": gen_n,
-                    "z_early": list(map(float, zE)),
-                    "z_mid": list(map(float, zM)),
-                    "z_late": list(map(float, zL)),
-                    **(
-                        {
-                            "entropy_mean": list(
-                                map(float, series.get("entropy_mean", []))
-                            )
-                        }
-                        if isinstance(series.get("entropy_mean", None), list)
-                        and len(series.get("entropy_mean", [])) == gen_n
-                        else {}
-                    ),
-                    "ranges": series.get("ranges", ranges),
-                    "z_mode": series.get("z_mode", "unknown"),
-                }
-        except Exception:
-            # omit series if malformed
-            pass
+    # Attach per-token band series (if present and well-formed)
+    _attach_band_series(telemetry_bands, metrics, ranges)
 
-    # -----------------------------
-    #  Extras: Noesis Neuro-Ontological Stress Profile (telemetry-only)
-    # -----------------------------
-    moe_summary_for_noesis = None
-    if metrics.per_layer_moe_routing_entropy is not None:
-        moe_entropies = metrics.per_layer_moe_routing_entropy
-        if moe_entropies:
-            moe_mean = float(sum(moe_entropies) / len(moe_entropies))
-            moe_max = float(max(moe_entropies))
-        else:
-            moe_mean, moe_max = None, None
-
-        num_experts2 = getattr(metrics, "num_experts", None)
-        if (
-            num_experts2 is None
-            and hasattr(model, "tension_tracer")
-            and hasattr(model.tension_tracer, "moe_num_experts")
-        ):
-            num_experts2 = model.tension_tracer.moe_num_experts
-
-        moe_anom = compute_moe_anomaly(
-            metrics=metrics,
-            moe_entropies=moe_entropies,
-            num_experts=num_experts2,
-            tension_index=tension_val,
-            drift_index=drift_val,
-            baseline_moe_stats=get_baseline_moe_stats(),
-        )
-
-        moe_summary_for_noesis = {
-            "mean_routing_entropy": moe_mean,
-            "max_routing_entropy": moe_max,
-            "num_experts": num_experts2,
-            "anomaly": moe_anom,
-        }
-
+    # -------- Noesis Neuro-Ontological Stress Profile (telemetry-only) ----
+    moe_summary_for_noesis = _build_moe_summary(metrics, model, tension_val, drift_val)
     noesis_profile = telemetry_noesis_profile(
         metrics=metrics,
         hti_v2=hti,
@@ -1542,9 +1625,8 @@ def build_trace_from_metrics(
         regime_baseline=regime_baseline,
     )
 
-
     # --- Classification stability (Phase III, telemetry-only) ---
-    stability_v0 = compute_stability_v0(
+    regime_info["stability_v0"] = compute_stability_v0(
         metrics=metrics,
         noesis_profile=noesis_profile,
         tension_index=tension_val,
@@ -1553,13 +1635,6 @@ def build_trace_from_metrics(
         is_safety_liminal=is_safety_liminal,
         regime_baseline=regime_baseline,
     )
-    # Attach next to the regime decision so downstream ingest can treat it as canonical.
-    regime_info["stability_v0"] = stability_v0
-
-
-    # Pull spike diagnostics (written into gen_params by compute_tension_for_prompt)
-    spike_layer_idx = (metrics.gen_params or {}).get("delta_spike_transition_idx")
-    spike_ratio = (metrics.gen_params or {}).get("delta_spike_ratio_vs_median")
 
     summary = {
         "mean_layer_delta": metrics.mean_layer_delta,
@@ -1572,16 +1647,15 @@ def build_trace_from_metrics(
         "max_curvature": metrics.max_curvature,
         "tension_index_v0_2": hti["tension_index"],
         "drift_index_v0_2": hti["drift_index"],
-        "hti_v0_2": hti["hti_v2"],
         "archetype": archetype_name,
         "is_safety_liminality": is_safety_liminal,
         "cognitive_regime": regime_info["label"],
-        "delta_spike_transition_idx": (metrics.gen_params or {}).get("delta_spike_transition_idx"),
-        "delta_spike_ratio_vs_median": (metrics.gen_params or {}).get("delta_spike_ratio_vs_median"),
+        "delta_spike_transition_idx": gen_params.get("delta_spike_transition_idx"),
+        "delta_spike_ratio_vs_median": gen_params.get("delta_spike_ratio_vs_median"),
         # KV summary
-        "kv_mean_coherence": kv_mean_coherence,
-        "kv_max_drift": kv_max_drift,
-        "kv_num_tokens": kv_num_tokens,
+        "kv_mean_coherence": kv_features["kv_mean_coherence"],
+        "kv_max_drift": kv_features["kv_max_drift"],
+        "kv_num_tokens": kv_features["kv_num_tokens"],
     }
 
     extras: Dict[str, Any] = {
@@ -1590,7 +1664,6 @@ def build_trace_from_metrics(
             "profile": noesis_profile,
             "cognitive_regime": regime_info,
         },
-        # === NEW: Attention / KV cache features ===
         "attention_features": {
             "attention_entropy_per_layer": getattr(metrics, "attention_entropy_per_layer", None),
             "attention_drift_history": getattr(metrics, "attention_drift_history", None),
@@ -1601,61 +1674,13 @@ def build_trace_from_metrics(
         "telemetry_bands": telemetry_bands,
     }
 
-    # --- MoE routing summary (if present) ---
-    if metrics.per_layer_moe_routing_entropy is not None:
-        moe_entropies = metrics.per_layer_moe_routing_entropy
+    moe_extras = _build_moe_extras(metrics, model, tension_val, drift_val)
+    if moe_extras is not None:
+        extras["moe"] = moe_extras
 
-        moe_layers = []
-        for idx, ent in enumerate(moe_entropies):
-            moe_layer_entry: Dict[str, Any] = {
-                "index": idx,
-                "routing_entropy": float(ent),
-            }
-            if metrics.per_layer_moe_top_expert_ids is not None and idx < len(
-                metrics.per_layer_moe_top_expert_ids
-            ):
-                moe_layer_entry["top_expert_ids"] = (
-                    metrics.per_layer_moe_top_expert_ids[idx]
-                )
-            moe_layers.append(moe_layer_entry)
-
-        num_experts2 = getattr(metrics, "num_experts", None)
-        if (
-            num_experts2 is None
-            and hasattr(model, "tension_tracer")
-            and hasattr(model.tension_tracer, "moe_num_experts")
-        ):
-            num_experts2 = model.tension_tracer.moe_num_experts
-
-        moe_mean = (
-            float(sum(moe_entropies) / len(moe_entropies)) if moe_entropies else None
-        )
-        moe_max = float(max(moe_entropies)) if moe_entropies else None
-
-        baseline_moe_stats = get_baseline_moe_stats()
-
-        moe_anom = compute_moe_anomaly(
-            metrics=metrics,
-            moe_entropies=moe_entropies,
-            num_experts=num_experts2,
-            tension_index=tension_val,
-            drift_index=drift_val,
-            baseline_moe_stats=baseline_moe_stats,
-        )
-
-        extras["moe"] = {
-            "layers": moe_layers,
-            "summary": {
-                "mean_routing_entropy": moe_mean,
-                "max_routing_entropy": moe_max,
-                "num_experts": num_experts2,
-                "anomaly": moe_anom,
-            },
-        }
-
-    trace = Trace(
-        schema_version="v0.3.2",
-        noesis_version="0.3.2",
+    return Trace(
+        schema_version="0.3.3",
+        noesis_version="0.3.3",
         model=model_info,
         run=run_info,
         tokens=tokens_info,
@@ -1664,8 +1689,6 @@ def build_trace_from_metrics(
         extras=extras,
     )
 
-    return trace
-
 
 def save_trace(trace: Trace, out_path: str):
     out_dir = os.path.dirname(out_path)
@@ -1673,37 +1696,6 @@ def save_trace(trace: Trace, out_path: str):
         os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w") as f:
         f.write(trace.to_json_str(indent=2))
-
-
-def compute_hti_calibration(all_metrics: List[TensionMetrics]):
-    """
-    Compute mean and std for the four HTI features across a calibration set.
-    Returns a dict with feature -> (mean, std).
-    """
-    mean_layer_deltas = [m.mean_layer_delta for m in all_metrics]
-    max_layer_deltas = [m.max_layer_delta for m in all_metrics]
-    final_entropies = [m.final_token_entropy for m in all_metrics]
-    head_conflicts = [m.mean_head_conflict for m in all_metrics]
-
-    def mean_std(xs):
-        cleaned = [x for x in xs if not (math.isnan(x) or math.isinf(x))]
-        if not cleaned:
-            return 0.0, 1.0
-        mu = statistics.fmean(cleaned)
-        sigma = statistics.pstdev(cleaned)
-        if sigma == 0.0:
-            sigma = 1.0
-        return mu, sigma
-
-    stats = {
-        "mean_layer_delta": mean_std(mean_layer_deltas),
-        "max_layer_delta": mean_std(max_layer_deltas),
-        "final_token_entropy": mean_std(final_entropies),
-        "mean_head_conflict": mean_std(head_conflicts),
-    }
-
-    return stats
-
 
 def compute_hti_calibration_v2(all_metrics: List[TensionMetrics]):
     """
@@ -1736,16 +1728,14 @@ def compute_hti_calibration_v2(all_metrics: List[TensionMetrics]):
 
     return stats
 
-
 # "hallucination tension index"
 def compute_hti_v2_for_metric(
-    m: TensionMetrics, stats: Dict[str, Any]
+        m: TensionMetrics, stats: Dict[str, Any]
 ) -> Dict[str, float]:
     """
     Compute HTI v0.2 components for a single run:
       - tension_index: effortful reasoning
       - drift_index: hallucination-like drift
-      - hti_v2: alias of drift_index for convenience
     Returns dict with these three keys.
     """
 
@@ -1764,7 +1754,7 @@ def compute_hti_v2_for_metric(
     mu_mhc, sd_mhc = stats["mean_head_conflict"]
     mu_curv, sd_curv = stats["mean_curvature"]
 
-    # ---------- TENSION (EFFORT) ----------
+    # TENSION (EFFORT)
     # Higher mean_layer_delta => more effort
     z_mld_eff = z_pos(m.mean_layer_delta, mu_mld, sd_mld)
     # Higher max_layer_delta => more effortful spikes
@@ -1776,7 +1766,7 @@ def compute_hti_v2_for_metric(
 
     z_tension = (z_mld_eff + z_xld_eff + z_curv_eff + z_mhc_eff) / 4.0
 
-    # ---------- DRIFT (HALLUCINATION-LIKE) ----------
+    # DRIFT (HALLUCINATION-LIKE)
     # Lower mean_layer_delta => shallower processing
     z_mld_drift = z_neg(m.mean_layer_delta, mu_mld, sd_mld)
     # Lower max_layer_delta => weaker spikes
@@ -1788,14 +1778,13 @@ def compute_hti_v2_for_metric(
 
     z_drift = (z_mld_drift + z_xld_drift + z_fte_drift + z_mhc_drift) / 4.0
 
-    # ---------- Squash to (0,1) via logistic ----------
+    # Squash to (0,1) via logistic
     tension_index = 1.0 / (1.0 + math.exp(-z_tension))
     drift_index = 1.0 / (1.0 + math.exp(-z_drift))
 
     return {
         "tension_index": tension_index,
         "drift_index": drift_index,
-        "hti_v2": drift_index,
     }
 
 
@@ -1831,7 +1820,6 @@ def classify_safety_liminality(
         and low_conflict
         and mid_or_late_spike
     )
-
 
 
 def telemetry_noesis_profile(
@@ -1965,343 +1953,471 @@ def telemetry_noesis_profile(
         },
     }
 
-def infer_cognitive_regime(
-    metrics: TensionMetrics,
+
+def score_regimes(f: RegimeFeatures, cfg: RegimeConfig) -> Dict[str, float]:
+    """
+    Returns score in [0,1] for every regime. Uses additive combination of
+    independent evidence, not multiplicative — preserving signal in borderline cases.
+    """
+    scores: Dict[str, float] = {}
+
+    # Use additive evidence with weights, then a final smooth squash... avoiding the multiplicative-collapse problem in compute_stability_v0.
+    scores["ethical_paradox"] = _combine([
+        (0.45, _ramp(f.tension,             *cfg.tension_hi)),
+        (0.40, _ramp(f.moral_paradox,       *cfg.moral_paradox_band)),
+        (0.15, _ramp(f.spike_ratio,         3.0, 9.0)),
+    ])
+
+    scores["false_premise_buckling"] = _combine([
+        (0.45, _ramp(f.drift,                  *cfg.drift_hi)),
+        (0.35, _ramp(f.false_presupposition,   *cfg.false_presup_band)),
+        (0.20, _ramp(f.kv_instability,         0.30, 0.70)),
+    ])
+
+    scores["symbolic_repetitive_drift"] = _combine([
+        (0.40, _ramp(f.drift,           0.40, 0.65)),
+        (0.40, _ramp(f.symbolic_score,  *cfg.symbolic_band)),
+        (0.20, _ramp(f.kv_stability,    *cfg.kv_stable_band)),
+    ])
+
+    scores["confident_hallucination_lite"] = _combine([
+        (0.35, _ramp(f.drift,                       0.55, 0.75)),
+        (0.30, _ramp(1.0 - f.tension,               0.55, 0.80)),
+        (0.20, _ramp(1.0 - f.false_presupposition,  0.80, 0.95)),
+        (0.15, 1.0 if (f.entropy_sustained or f.kv_instability > 0.5) else 0.0),
+    ])
+
+    scores["liminal_drift"] = _combine([
+        (0.40, _ramp(f.drift, 0.45, 0.70)),
+        (0.30, max(
+            _ramp(f.ambiguous_containment, 0.08, 0.20),
+            _ramp(f.paradox_pressure,      0.08, 0.20),
+        )),
+        (0.30, _ramp(f.kv_instability, 0.40, 0.70)),
+    ])
+
+    scores["safety_procedural"] = _combine([
+        (0.40, _ramp(1.0 - f.drift,                  0.55, 0.80)),
+        (0.30, _ramp(1.0 - f.false_presupposition,   0.75, 0.95)),
+        (0.20, _ramp(f.kv_stability,                 0.55, 0.80)),
+        (0.10, 1.0 if f.low_entropy else 0.0),
+    ])
+
+    scores["factual_stable"] = _combine([
+        (0.40, _ramp(1.0 - f.tension, 0.45, 0.70)),
+        (0.40, _ramp(1.0 - f.drift,   0.55, 0.80)),
+        (0.20, 1.0 if f.in_factual_control_band else 0.0),
+    ])
+
+    scores["safety_liminality"] = 1.0 if f.is_safety_liminal else 0.0
+
+    return scores
+
+def _ramp(x: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 1.0 if x >= hi else 0.0
+    return max(0.0, min(1.0, (x - lo) / (hi - lo)))
+
+def _combine(weighted: List[Tuple[float, float]]) -> float:
+    """Weighted average — doesn't collapse to zero."""
+    total_w = sum(w for w, _ in weighted) or 1.0
+    return sum(w * v for w, v in weighted) / total_w
+
+def arbitrate(
+    scores: Dict[str, float],
+    f: RegimeFeatures,
+    cfg: RegimeConfig,
+) -> Dict[str, Any]:
+    # Hard policy overrides — score boosts, not branches
+    scores = dict(scores)  # copy
+
+    if f.label == "class_a" and f.in_factual_control_band and f.drift < 0.62:
+        scores["factual_stable"] = max(scores["factual_stable"], 0.85)
+
+    if f.is_safety_liminal:
+        scores["safety_liminality"] = max(scores["safety_liminality"], 0.75)
+
+    # Residual bucket replaces the compute_stability_v0 formula: mixed_unclear only wins when no regime has meaningful evidence.
+    top_real = max((v for k, v in scores.items() if k != "mixed_unclear"), default=0.0)
+    scores["mixed_unclear"] = max(0.0, 0.35 - top_real)  # caps mixed_unclear at 0.35
+
+    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    top, top_s = ordered[0]
+    second, second_s = ordered[1]
+    margin = top_s - second_s
+
+    if top_s >= 0.55 and margin >= 0.15:
+        bucket = "stable"
+    elif top_s >= 0.40 and margin >= 0.05:
+        bucket = "boundary"
+    else:
+        bucket = "indeterminate"
+
+    return {
+        "label": top,
+        "scores": scores,
+        "runner_up": second,
+        "top_score": top_s,
+        "second_score": second_s,
+        "classification_margin": margin,
+        "margin_bucket": bucket,
+    }
+
+def build_regime_features(
+    metrics: "TensionMetrics",
     noesis_profile: Dict[str, Any],
     tension_index: Optional[float],
     drift_index: Optional[float],
     is_safety_liminal: bool,
     regime_baseline: Optional[Dict[str, float]] = None,
-) -> Dict[str, Any]:
+    cfg: RegimeConfig = REGIME_CONFIG,
+) -> RegimeFeatures:
     """
-    Classify cognitive regime using HTI + Noesis profile + KV telemetry.
-
-    KV interpretation:
-      - high coherence + low final drift => stable/procedural or repetitive regime
-      - high coherence + symbolic drift => symbolic_repetitive_drift
-      - high final drift or rising norm trend => active rewrite / liminal instability
+    Extract every signal the regime pipeline needs from a single TensionMetrics +
+    noesis profile pair. This replaces the duplicated extraction logic that previously
+    lived in both infer_cognitive_regime and compute_stability_v0.
     """
-    def safe(x, default=0.5):
-        return float(x) if x is not None else default
 
-    def clamp01(x: float) -> float:
-        return float(max(0.0, min(1.0, x)))
+    # local helpers
+    def _safe(x, default: float = 0.5) -> float:
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return float(default)
+        return v if math.isfinite(v) else float(default)
 
-    def recent_mean(xs, window: int = 12, default: float = 0.0) -> float:
+    def _clamp01(x: float) -> float:
+        return float(max(0.0, min(1.0, _safe(x, 0.0))))
+
+    def _recent_mean(xs, window: int = 12, default: float = 0.0) -> float:
         if not xs:
             return float(default)
         tail = [float(x) for x in xs[-window:] if x is not None]
         return float(sum(tail) / len(tail)) if tail else float(default)
 
-    def relative_trend(xs, window: int = 12) -> float:
-        """
-        Relative late-vs-early trend in the recent KV mean norm series.
-        Positive => norm accumulation.
-        Negative => norm decay.
-        """
+    def _relative_trend(xs, window: int = 12) -> float:
         if not xs or len(xs) < 4:
             return 0.0
-
         tail = [float(x) for x in xs[-window:] if x is not None]
         if len(tail) < 4:
             return 0.0
-
         mid = len(tail) // 2
         early = tail[:mid]
         late = tail[mid:]
-
         early_mean = sum(early) / max(len(early), 1)
         late_mean = sum(late) / max(len(late), 1)
-
         denom = abs(early_mean) + 1e-8
         return float((late_mean - early_mean) / denom)
 
-    tension = safe(tension_index, 0.5)
-    drift = safe(drift_index, 0.5)
+    # macro indices
+    tension = _safe(tension_index, 0.5)
+    drift = _safe(drift_index, 0.5)
+    spike_ratio = _safe((metrics.gen_params or {}).get("delta_spike_ratio_vs_median"), 0.0)
 
-    vec = noesis_profile.get("vector") or [0.0] * 12
+    # noesis category vector
+    raw_vec = noesis_profile.get("vector") if isinstance(noesis_profile, dict) else None
+    vec: List[float] = []
+    if isinstance(raw_vec, (list, tuple)):
+        for i in range(12):
+            vec.append(_safe(raw_vec[i] if i < len(raw_vec) else 0.0, 0.0))
+    else:
+        vec = [0.0] * 12
 
-    moral_paradox = float(vec[0] or 0.0)
-    false_presupposition = float(vec[1] or 0.0)
-    symbolism = float(vec[6] or 0.0)
-    ambiguous_containment = float(vec[7] or 0.0)
-    paradox_pressure = float(vec[9] or 0.0)
+    moral_paradox = vec[0]
+    false_presupposition = vec[1]
+    symbolism = vec[6]
+    ambiguous_containment = vec[7]
+    paradox_pressure = vec[9]
+    aesthetic_logic = vec[10]
+    symbolic_score = max(symbolism, ambiguous_containment, aesthetic_logic)
 
-    # ====================== KV Cache Aggregates ======================
+    # KV cache aggregates
     kv_drift_list = getattr(metrics, "kv_norm_drift_history", None) or []
     kv_coherence_list = getattr(metrics, "kv_coherence_history", None) or []
     kv_mean_norm_list = getattr(metrics, "kv_mean_norm_history", None) or []
 
-    recent_kv_drift = recent_mean(kv_drift_list, window=12, default=0.0)
-    recent_kv_coherence = recent_mean(kv_coherence_list, window=12, default=0.75)
-    recent_kv_mean_norm = recent_mean(kv_mean_norm_list, window=12, default=0.0)
-
+    recent_kv_drift = _recent_mean(kv_drift_list, window=12, default=0.0)
+    recent_kv_coherence = _recent_mean(kv_coherence_list, window=12, default=0.75)
     kv_final_drift = float(kv_drift_list[-1]) if kv_drift_list else 0.0
     kv_max_drift = float(max(kv_drift_list)) if kv_drift_list else 0.0
-    kv_norm_trend = relative_trend(kv_mean_norm_list, window=12)
+    kv_norm_trend = _relative_trend(kv_mean_norm_list, window=12)
 
-    # Drift scale is heuristic because raw KV norms are model-dependent.
-    # Keep this conservative and mostly use coherence + relative trend.
-    drift_pressure = clamp01(max(recent_kv_drift, kv_final_drift) * 1.0)
-    trend_pressure = clamp01(max(0.0, kv_norm_trend) * 4.0)
+    drift_pressure = _clamp01(max(recent_kv_drift, kv_final_drift))
+    trend_pressure = _clamp01(max(0.0, kv_norm_trend) * 4.0)
+    kv_stability = _clamp01(recent_kv_coherence * (1.0 - drift_pressure))
+    kv_instability = _clamp01(1.0 - kv_stability + 0.25 * trend_pressure)
 
-    kv_stability = clamp01(recent_kv_coherence * (1.0 - drift_pressure))
-    kv_instability = clamp01(1.0 - kv_stability + 0.25 * trend_pressure)
+    kv_num_tokens = len(kv_drift_list)
+    kv_reliable = kv_num_tokens >= cfg.min_kv_tokens
+    kv_accumulating = kv_reliable and kv_norm_trend > 0.06
+    kv_late_jump = kv_reliable and kv_final_drift > max(0.03, recent_kv_drift * 1.75)
+    kv_spiky = kv_reliable and kv_max_drift > max(0.05, recent_kv_drift * 2.5)
 
-    kv_features = {
-        "kv_stability": kv_stability,
-        "kv_instability": kv_instability,
-        "kv_recent_drift": recent_kv_drift,
-        "kv_final_drift": kv_final_drift,
-        "kv_max_drift": kv_max_drift,
-        "kv_recent_coherence": recent_kv_coherence,
-        "kv_recent_mean_norm": recent_kv_mean_norm,
-        "kv_norm_trend": kv_norm_trend,
-        "kv_num_tokens": len(kv_drift_list),
-    }
-
-    # ====================== Core Regime Logic ======================
-    spike_ratio = (metrics.gen_params or {}).get("delta_spike_ratio_vs_median", 0.0)
-    spike_ratio = float(spike_ratio or 0.0)
-
-    high_tension = (tension >= 0.69) and (spike_ratio > 9.0)
-    low_tension = tension <= 0.40
-    high_drift = drift >= 0.60
-    mid_drift = 0.45 <= drift < 0.60
-    low_drift = drift < 0.45
-
+    # entropy / attention
     attn_entropy_list = getattr(metrics, "attention_entropy_per_layer", None) or []
-    recent_entropy = recent_mean(attn_entropy_list, window=8, default=1.5)
-    low_entropy = recent_entropy < 1.1
+    recent_attn_entropy = _recent_mean(attn_entropy_list, window=8, default=1.5)
+    low_entropy = recent_attn_entropy < 1.1
 
-    symbolic_score = max(symbolism, ambiguous_containment, float(vec[10] or 0.0))
-
-    # === Hard overrides ===
-    if is_safety_liminal:
-        if (mid_drift or high_drift) and kv_stability > 0.82 and symbolic_score >= 0.085:
-            return {
-                "label": "symbolic_repetitive_drift",
-                "explanation": "Safety liminality + symbolic signal + highly stable KV trajectory.",
-                "features": {
-                    "tension": tension,
-                    "drift": drift,
-                    "symbolism": symbolism,
-                    **kv_features,
-                },
-            }
-
-        return {
-            "label": "safety_liminality",
-            "explanation": "Explicit safety liminality flag.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                **kv_features,
-            },
-        }
-
-    # === Main regimes ===
-    if high_tension and moral_paradox > 0.25:
-        return {
-            "label": "ethical_paradox",
-            "explanation": "High tension with strong moral-conflict telemetry.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "moral_paradox": moral_paradox,
-                **kv_features,
-            },
-        }
-
-    if high_drift and false_presupposition > 0.25:
-        return {
-            "label": "false_premise_buckling",
-            "explanation": "High drift with strong false-presupposition telemetry.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "false_presupposition": false_presupposition,
-                **kv_features,
-            },
-        }
-
-    if (mid_drift or high_drift) and symbolic_score > 0.16 and kv_stability > 0.78:
-        return {
-            "label": "symbolic_repetitive_drift",
-            "explanation": "Symbolic drift with stable KV memory trajectory.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "symbolic_score": symbolic_score,
-                **kv_features,
-            },
-        }
-
-    if low_tension and high_drift and false_presupposition < 0.12:
-        return {
-            "label": "confident_hallucination_lite",
-            "explanation": "Low tension and high drift without strong false-premise category concentration.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "false_presupposition": false_presupposition,
-                **kv_features,
-            },
-        }
-
-    if low_drift and false_presupposition < 0.12 and (kv_stability > 0.75 or low_entropy):
-        return {
-            "label": "safety_procedural",
-            "explanation": "Low drift with stable/procedural KV context.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "low_entropy": low_entropy,
-                **kv_features,
-            },
-        }
-
-    if (high_drift or mid_drift) and kv_instability > 0.45 and (
-        ambiguous_containment > 0.20 or paradox_pressure > 0.20
-    ):
-        return {
-            "label": "liminal_drift",
-            "explanation": "Ambiguous/paradoxical framing with unstable KV trajectory.",
-            "features": {
-                "tension": tension,
-                "drift": drift,
-                "ambiguous_containment": ambiguous_containment,
-                "paradox_pressure": paradox_pressure,
-                **kv_features,
-            },
-        }
-
-    return {
-        "label": "mixed_unclear",
-        "explanation": "No strong signature detected.",
-        "features": {
-            "tension": tension,
-            "drift": drift,
-            **kv_features,
-        },
-    }
-
-def compute_stability_v0(
-    *,
-    metrics: TensionMetrics,
-    noesis_profile: Dict[str, Any],
-    tension_index: Optional[float],
-    drift_index: Optional[float],
-    regime_label: str,
-    is_safety_liminal: bool,
-    regime_baseline: Optional[Dict[str, float]] = None,
-) -> Dict[str, Any]:
-    """
-    Minimal stability signal for Phase III.
-    Now includes support for symbolic_repetitive_drift + class_a control guard.
-    """
-
-    def safe(x, default=0.5):
-        return float(x) if x is not None else default
-
-    def clamp01(x: float) -> float:
-        return max(0.0, min(1.0, x))
-
-    tension = safe(tension_index, 0.5)
-    drift = safe(drift_index, 0.5)
-    vec = noesis_profile.get("vector") or [0.0] * 12
-
-    moral_paradox = float(vec[0] or 0.0)
-    false_presupposition = float(vec[1] or 0.0)
-    category_collision = float(vec[4] or 0.0)
-    symbolism = float(vec[6] or 0.0)
-    ambiguous_containment = float(vec[7] or 0.0)
-    paradox_pressure = float(vec[9] or 0.0)
-
-    mean_entropy = float(getattr(metrics, "mean_logit_entropy", 0.0) or 0.0)
-    final_entropy = float(getattr(metrics, "final_token_entropy", 0.0) or 0.0)
+    mean_entropy = _safe(getattr(metrics, "mean_logit_entropy", 0.0), 0.0)
+    final_entropy = _safe(getattr(metrics, "final_token_entropy", 0.0), 0.0)
     entropy_sustained = (mean_entropy > 1e-9) and (final_entropy >= 0.95 * mean_entropy)
 
-    # ---- Baseline control band (for class_a guard) ----
+    attn_drift_list = getattr(metrics, "attention_drift_history", None) or []
+    kv_reuse_list = getattr(metrics, "kv_reuse_scores", None) or []
+    mean_attn_drift = _recent_mean(attn_drift_list, window=12, default=0.0)
+    mean_kv_reuse = _recent_mean(kv_reuse_list, window=12, default=1.0)
+
+    # baseline control band
     in_factual_control_band = False
     if regime_baseline:
-        t_mu = float(regime_baseline.get("factual_tension_mu", 0.5))
-        t_sd = float(regime_baseline.get("factual_tension_sigma", 1.0))
-        d_mu = float(regime_baseline.get("factual_drift_mu", 0.5))
-        d_sd = float(regime_baseline.get("factual_drift_sigma", 1.0))
-        z_t = (tension - t_mu) / t_sd if t_sd != 0 else 0.0
-        z_d = (drift - d_mu) / d_sd if d_sd != 0 else 0.0
+        t_mu = _safe(regime_baseline.get("factual_tension_mu", 0.5), 0.5)
+        t_sd = _safe(regime_baseline.get("factual_tension_sigma", 1.0), 1.0)
+        d_mu = _safe(regime_baseline.get("factual_drift_mu", 0.5), 0.5)
+        d_sd = _safe(regime_baseline.get("factual_drift_sigma", 1.0), 1.0)
+        z_t = (tension - t_mu) / t_sd if abs(t_sd) > 1e-9 else 0.0
+        z_d = (drift - d_mu) / d_sd if abs(d_sd) > 1e-9 else 0.0
         in_factual_control_band = (abs(z_t) <= 2.0) and (abs(z_d) <= 2.0)
 
-    scores = {}
-
-    # Existing regimes
-    scores["factual_stable"] = clamp01((0.55 - tension) / 0.30) * clamp01(
-        (0.45 - drift) / 0.30
-    )
-    scores["ethical_paradox"] = clamp01((tension - 0.55) / 0.25) * moral_paradox
-    scores["confident_hallucination_lite"] = (
-        clamp01((drift - 0.50) / 0.25)
-        * clamp01((0.30 - false_presupposition) / 0.30)
-        * (1.0 if entropy_sustained else 0.0)
-    )
-    scores["exploratory_liminal"] = clamp01((drift - 0.45) / 0.35) * clamp01(
-        (paradox_pressure + ambiguous_containment) / 0.40
-    )
-    scores["safety_liminality"] = clamp01((drift - 0.55) / 0.25) * (
-        1.0 if is_safety_liminal else 0.0
-    )
-    scores["safety_procedural"] = (
-        clamp01((0.30 - false_presupposition) / 0.30)
-        * clamp01((0.55 - drift) / 0.30)
-        * (1.0 if not is_safety_liminal else 0.0)
-    )
-
-    # New regime support
-    symbolic_score = max(symbolism, ambiguous_containment, vec[10])
-    scores["symbolic_repetitive_drift"] = clamp01((drift - 0.45) / 0.35) * clamp01(
-        (symbolic_score - 0.085) / 0.10
-    )
-
-    # Fallback
-    max_other = max(v for k, v in scores.items() if k != "mixed_unclear")
-    scores["mixed_unclear"] = clamp01(1.0 - max_other) * 0.8
-
-    # Top-2 margin
-    ordered = sorted(scores.items(), key=lambda kv: (-float(kv[1]), kv[0]))
-    top_regime, top_score = ordered[0]
-    second_regime, second_score = ordered[1] if len(ordered) > 1 else (top_regime, 0.0)
-    margin = float(top_score) - float(second_score)
-
-    bucket = (
-        "stable"
-        if margin >= 0.20
-        else "boundary" if margin >= 0.05 else "indeterminate"
+    return RegimeFeatures(
+        tension=tension,
+        drift=drift,
+        spike_ratio=spike_ratio,
+        moral_paradox=moral_paradox,
+        false_presupposition=false_presupposition,
+        symbolism=symbolism,
+        ambiguous_containment=ambiguous_containment,
+        paradox_pressure=paradox_pressure,
+        symbolic_score=symbolic_score,
+        kv_stability=kv_stability,
+        kv_instability=kv_instability,
+        kv_norm_trend=kv_norm_trend,
+        kv_reliable=kv_reliable,
+        kv_accumulating=kv_accumulating,
+        kv_late_jump=kv_late_jump,
+        kv_spiky=kv_spiky,
+        low_entropy=low_entropy,
+        entropy_sustained=entropy_sustained,
+        mean_attn_drift=mean_attn_drift,
+        mean_kv_reuse=mean_kv_reuse,
+        in_factual_control_band=in_factual_control_band,
+        is_safety_liminal=bool(is_safety_liminal),
+        label=getattr(metrics, "label", None),
+        kv_recent_drift=recent_kv_drift,
+        kv_final_drift=kv_final_drift,
+        kv_max_drift=kv_max_drift,
+        kv_recent_coherence=recent_kv_coherence,
+        kv_num_tokens=kv_num_tokens,
     )
 
-    # === CLASS_A GUARD: force stable on clean control prompts ===
-    if (
-        getattr(metrics, "label", None) == "class_a"
-        and regime_baseline
-        and in_factual_control_band
-    ):
-        bucket = "stable"
-
+def _features_dict(f: RegimeFeatures) -> Dict[str, Any]:
+    """RegimeFeatures back to the legacy flat dict shape used in trace outputs..."""
     return {
-        "top_regime": top_regime,
-        "second_regime": second_regime,
-        "top_score": float(top_score),
-        "second_score": float(second_score),
-        "classification_margin": float(margin),
-        "margin_bucket": bucket,
-        "label_matches_top": bool(regime_label == top_regime),
+        # macro
+        "tension": f.tension,
+        "drift": f.drift,
+        "spike_ratio": f.spike_ratio,
+        # noesis vector signals
+        "moral_paradox": f.moral_paradox,
+        "false_presupposition": f.false_presupposition,
+        "symbolism": f.symbolism,
+        "ambiguous_containment": f.ambiguous_containment,
+        "paradox_pressure": f.paradox_pressure,
+        "symbolic_score": f.symbolic_score,
+        # KV
+        "kv_stability": f.kv_stability,
+        "kv_instability": f.kv_instability,
+        "kv_recent_drift": f.kv_recent_drift,
+        "kv_final_drift": f.kv_final_drift,
+        "kv_max_drift": f.kv_max_drift,
+        "kv_recent_coherence": f.kv_recent_coherence,
+        "kv_norm_trend": f.kv_norm_trend,
+        "kv_num_tokens": f.kv_num_tokens,
+        "kv_reliable": f.kv_reliable,
+        "kv_accumulating": f.kv_accumulating,
+        "kv_late_jump": f.kv_late_jump,
+        "kv_spiky": f.kv_spiky,
+        # entropy / attention
+        "low_entropy": f.low_entropy,
+        "entropy_sustained": f.entropy_sustained,
+        "mean_attn_drift": f.mean_attn_drift,
+        "mean_kv_reuse": f.mean_kv_reuse,
+        # policy
+        "in_factual_control_band": f.in_factual_control_band,
+        "is_safety_liminal": f.is_safety_liminal,
+        "label": f.label,
     }
 
-# -----------------------------
+def _explain(result: Dict[str, Any], f: RegimeFeatures) -> str:
+    """
+    Build a short readable explaination for regime classification.
+
+    Reads the arbitration result (scores, top label, runner-up, margin) and the
+    underlying feature bundle, then emits a deterministic explanation string
+    that names the dominant evidence channels and any close competitors.
+    """
+    label: str = result["label"]
+    top_score: float = float(result["top_score"])
+    runner_up: str = result["runner_up"]
+    second_score: float = float(result["second_score"])
+    margin: float = float(result["classification_margin"])
+    bucket: str = result.get("margin_bucket", "unknown")
+
+    # per-regime evidence narratives
+    # Each entry returns a list of short phrases describing which signals fired.
+    def _evidence_for(regime: str) -> List[str]:
+        ev: List[str] = []
+
+        if regime == "ethical_paradox":
+            if f.tension >= 0.62:
+                ev.append(f"high tension={f.tension:.2f}")
+            if f.moral_paradox >= 0.18:
+                ev.append(f"moral_paradox={f.moral_paradox:.2f}")
+            if f.spike_ratio >= 3.0:
+                ev.append(f"late-layer spike ratio={f.spike_ratio:.1f}")
+
+        elif regime == "false_premise_buckling":
+            if f.drift >= 0.55:
+                ev.append(f"high drift={f.drift:.2f}")
+            if f.false_presupposition >= 0.15:
+                ev.append(f"false_presupposition={f.false_presupposition:.2f}")
+            if f.kv_instability >= 0.30:
+                ev.append(f"KV instability={f.kv_instability:.2f}")
+            if f.kv_late_jump:
+                ev.append("KV late-jump")
+
+        elif regime == "symbolic_repetitive_drift":
+            if f.drift >= 0.40:
+                ev.append(f"drift={f.drift:.2f}")
+            if f.symbolic_score >= 0.08:
+                ev.append(f"symbolic_score={f.symbolic_score:.2f}")
+            if f.kv_stability >= 0.55:
+                ev.append(f"stable KV={f.kv_stability:.2f}")
+
+        elif regime == "confident_hallucination_lite":
+            if f.drift >= 0.55:
+                ev.append(f"high drift={f.drift:.2f}")
+            if f.tension <= 0.45:
+                ev.append(f"low tension={f.tension:.2f}")
+            if f.entropy_sustained:
+                ev.append("sustained entropy")
+            if f.kv_instability > 0.5:
+                ev.append(f"KV instability={f.kv_instability:.2f}")
+            if f.false_presupposition < 0.20:
+                ev.append("no strong false-premise signal")
+
+        elif regime == "liminal_drift":
+            if f.drift >= 0.45:
+                ev.append(f"drift={f.drift:.2f}")
+            if f.ambiguous_containment >= 0.08:
+                ev.append(f"ambiguous_containment={f.ambiguous_containment:.2f}")
+            if f.paradox_pressure >= 0.08:
+                ev.append(f"paradox_pressure={f.paradox_pressure:.2f}")
+            if f.kv_instability >= 0.40:
+                ev.append(f"KV instability={f.kv_instability:.2f}")
+
+        elif regime == "safety_procedural":
+            if f.drift <= 0.45:
+                ev.append(f"low drift={f.drift:.2f}")
+            if f.false_presupposition <= 0.20:
+                ev.append("no false-premise signal")
+            if f.kv_stability >= 0.55:
+                ev.append(f"stable KV={f.kv_stability:.2f}")
+            if f.low_entropy:
+                ev.append("low attention entropy")
+            if f.in_factual_control_band and f.label == "class_a":
+                ev.append("inside factual control band")
+
+        elif regime == "factual_stable":
+            if f.tension <= 0.45:
+                ev.append(f"low tension={f.tension:.2f}")
+            if f.drift <= 0.45:
+                ev.append(f"low drift={f.drift:.2f}")
+            if f.in_factual_control_band:
+                ev.append("inside factual control band")
+
+        elif regime == "safety_liminality":
+            if f.is_safety_liminal:
+                ev.append("safety-liminal flag set")
+            if f.drift >= 0.55:
+                ev.append(f"high drift={f.drift:.2f}")
+
+        elif regime == "mixed_unclear":
+            ev.append("no regime accumulated meaningful evidence")
+
+        return ev
+
+    # produce the explanation
+    parts: List[str] = []
+
+    top_ev = _evidence_for(label)
+    if top_ev:
+        parts.append(f"{label} ({top_score:.2f}) driven by " + ", ".join(top_ev))
+    else:
+        parts.append(f"{label} ({top_score:.2f}) selected by default")
+
+    # Note runner-up only when it's actually close — keeps the message useful.
+    if margin < 0.15 and second_score > 0.20 and runner_up != label:
+        runner_ev = _evidence_for(runner_up)
+        runner_phrase = (
+            f"runner-up {runner_up} ({second_score:.2f}, margin={margin:.2f})"
+        )
+        if runner_ev:
+            runner_phrase += " with " + ", ".join(runner_ev[:2])  # cap noise
+        parts.append(runner_phrase)
+
+    # Decisiveness bucket — surfaces the new "real stability" interpretation.
+    parts.append(f"decisiveness={bucket}")
+
+    # Reliability issues — important for downstream consumers.
+    caveats: List[str] = []
+    if not f.kv_reliable:
+        caveats.append(f"KV unreliable ({f.kv_num_tokens} tokens)")
+    if caveats:
+        parts.append("caveats: " + "; ".join(caveats))
+
+    return "; ".join(parts)
+
+
+def infer_cognitive_regime(metrics, noesis_profile, tension_index, drift_index,
+                           is_safety_liminal, regime_baseline=None):
+    """
+    wrappers around old functions for now.
+    """
+    f = build_regime_features(metrics, noesis_profile, tension_index, drift_index,
+                              is_safety_liminal, regime_baseline)
+    scores = score_regimes(f, REGIME_CONFIG)
+    result = arbitrate(scores, f, REGIME_CONFIG)
+    return {
+        "label": result["label"],
+        "explanation": _explain(result, f),
+        "features": _features_dict(f),
+        "scores": result["scores"],          # new .. full vector available
+        "margin": result["classification_margin"],
+    }
+
+
+def compute_stability_v0(*, metrics, noesis_profile, tension_index, drift_index,
+                         regime_label, is_safety_liminal, regime_baseline=None):
+    """
+    wrappers around old functions for now.
+    """
+    f = build_regime_features(metrics, noesis_profile, tension_index, drift_index,
+                              is_safety_liminal, regime_baseline)
+    scores = score_regimes(f, REGIME_CONFIG)
+    result = arbitrate(scores, f, REGIME_CONFIG)
+
+    return {
+        "top_regime": result["label"],
+        "second_regime": result["runner_up"],
+        "top_score": result["top_score"],
+        "second_score": result["second_score"],
+        "classification_margin": result["classification_margin"],
+        "margin_bucket": result["margin_bucket"],
+        "label_matches_top": (regime_label == result["label"]),  # now meaningful
+        "class_a_guard_applied": (f.label == "class_a" and f.in_factual_control_band),
+    }
+
 #  Utility: Entropy
-# -----------------------------
-
-
 def logit_entropy(logits: torch.Tensor) -> float:
     """
     logits: [vocab] or [batch, vocab]
@@ -2328,8 +2444,7 @@ def logit_entropy(logits: torch.Tensor) -> float:
 
 def compute_head_conflict(attentions) -> List[float]:
     """
-    attentions: tuple of length num_layers
-        each element: [batch, heads, seq, seq]
+    attentions: tuple of length num_layers each element: [batch, heads, seq, seq]
     Returns per-layer mean head conflict (1 - cosine similarity between heads).
     """
     per_layer_conflict = []
@@ -2369,11 +2484,17 @@ def compute_curvature_from_hidden(
     hidden_layers: List[torch.Tensor],
 ) -> List[Optional[float]]:
     """
-    hidden_layers: list of [batch, seq, d_model], one per transformer block.
-    Returns curvature per *layer index* (length = num_layers):
-        curvature[L] = 1 - cos(Δ_L, Δ_{L+1})
-    where Δ_L = mean_over_tokens(h_{L+1} - h_L)
-    For the last two layers (no Δ_{L+1} exists), curvature is None.
+    Compute curvature values from hidden layers.
+
+    This function calculates the curvature of hidden representations across consecutive layers.
+    Curvature is computed as the complement of cosine similarity between successive
+    differences in hidden states, providing a measure of how much the representation changes
+    across adjacent layers.
+
+    :param hidden_layers: List of hidden layer tensors with shape [batch_size, sequence_length, hidden_dim]
+    :return: List of curvature values for each layer (excluding first and last), where None indicates
+             undefined curvature due to insufficient layers or numerical issues
+
     """
     num_layers = len(hidden_layers)
 
@@ -2420,7 +2541,6 @@ def compute_curvature_from_hidden(
 
 
 #  Core: run model + extract tension
-
 def _band_ranges(n: int) -> dict:
     if n <= 1:
         return {"early": [0, 0], "mid": [0, 0], "late": [0, 0]}
@@ -2431,6 +2551,81 @@ def _band_ranges(n: int) -> dict:
         "mid": [a, max(a, b - 1)],
         "late": [b, n - 1],
     }
+
+
+def _finite_or_zero(x: float) -> float:
+    x = float(x)
+    return x if math.isfinite(x) else 0.0
+
+
+def _resolve_temperature(temperature: float | None) -> float:
+    if temperature is not None and temperature > 0:
+        return float(temperature)
+    return 1.0
+
+
+def _compute_token_stats(logits_raw: torch.Tensor, temperature: float) -> tuple[float, float, float]:
+    probs = F.softmax(logits_raw / temperature, dim=-1).float()
+    entropy = float(-(probs * probs.clamp(min=1e-9).log()).sum(dim=-1).mean().item())
+    confidence = float(probs.max(dim=-1).values.mean().item())
+    sorted_p, _ = torch.sort(probs, descending=True)
+    margin = float((sorted_p[:, 0] - sorted_p[:, 1]).mean().item())
+    return entropy, confidence, margin
+
+
+def _apply_top_p(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    cum = torch.cumsum(probs, dim=-1)
+    mask = cum > top_p
+    mask[..., 0] = False
+    sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
+    return torch.zeros_like(logits).scatter(1, sorted_idx, sorted_logits)
+
+
+def _sample_next_token(
+    logits_raw: torch.Tensor,
+    do_sample: bool,
+    temperature: float | None,
+    top_p: float | None,
+) -> torch.Tensor:
+    if not do_sample:
+        return torch.argmax(logits_raw, dim=-1, keepdim=True)
+    logits = logits_raw / _resolve_temperature(temperature)
+    if top_p is not None and float(top_p) < 1.0:
+        logits = _apply_top_p(logits, float(top_p))
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def _extract_band_z(tracer, ranges: dict) -> tuple[float, float, float]:
+    step = tracer.get_step_band_z(ranges)
+    return (
+        _finite_or_zero(step["z_early"]),
+        _finite_or_zero(step["z_mid"]),
+        _finite_or_zero(step["z_late"]),
+    )
+
+
+def _build_telemetry(
+    zE, zM, zL, ranges, tracer, skip_warmstart, warmstart_outlier_observed,
+    max_new_tokens, do_sample, temperature, top_p,
+) -> dict:
+    return {
+        "generated_token_count": len(zE),
+        "z_early": zE,
+        "z_mid": zM,
+        "z_late": zL,
+        "ranges": ranges,
+        "z_mode": getattr(tracer, "band_z_mode", "unknown"),
+        "skip_warmstart": bool(skip_warmstart),
+        "warmstart_outlier_observed": bool(warmstart_outlier_observed),
+        "max_new_tokens": int(max_new_tokens),
+        "do_sample": bool(do_sample),
+        "temperature": float(temperature) if temperature is not None else None,
+        "top_p": float(top_p) if top_p is not None else None,
+    }
+
 
 @torch.no_grad()
 def decode_with_band_capture(
@@ -2447,10 +2642,9 @@ def decode_with_band_capture(
     skip_warmstart: bool = True,
 ):
     input_ids = inputs["input_ids"]
-    attention_mask = inputs.get("attention_mask", None)
+    attention_mask = inputs.get("attention_mask")
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)
-
     eos_id = tokenizer.eos_token_id
 
     zE, zM, zL = [], [], []
@@ -2461,10 +2655,8 @@ def decode_with_band_capture(
     tracer.clear_step()
     out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
     past = out.past_key_values
-
     full_ids = input_ids
 
-    # DF-1 regime probe state.
     probe = RegimeProbe(
         ent_hist=deque(maxlen=8),
         conf_hist=deque(maxlen=6),
@@ -2472,58 +2664,20 @@ def decode_with_band_capture(
         drift_hist=deque(maxlen=64),
     )
 
-    def _temp_for_stats():
-        return (
-            float(temperature) if (temperature is not None and temperature > 0) else 1.0
-        )
-
     for _t in range(max_new_tokens):
         logits_raw = out.logits[:, -1, :]
 
-        # Compute token-level stats for regime probe logic.
-        probs_stats = F.softmax(logits_raw / _temp_for_stats(), dim=-1)
-        p = probs_stats.float()
-
-        token_entropy = float(
-            -(p * p.clamp(min=1e-9).log()).sum(dim=-1).mean().item()
+        # Update regime probe with token-level stats.
+        entropy, confidence, margin = _compute_token_stats(
+            logits_raw, _resolve_temperature(temperature)
         )
-        token_conf = float(p.max(dim=-1).values.mean().item())
+        probe.ent_hist.append(entropy)
+        probe.conf_hist.append(confidence)
+        probe.margin_hist.append(margin)
 
-        sorted_p, _ = torch.sort(p, descending=True)
-        token_margin = float((sorted_p[:, 0] - sorted_p[:, 1]).mean().item())
-
-        probe.ent_hist.append(token_entropy)
-        probe.conf_hist.append(token_conf)
-        probe.margin_hist.append(token_margin)
-
-        # Select next token.
-        if do_sample:
-            temp = (
-                float(temperature)
-                if (temperature is not None and temperature > 0)
-                else 1.0
-            )
-            logits = logits_raw / temp
-
-            if top_p is not None and float(top_p) < 1.0:
-                pval = float(top_p)
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                probs = torch.softmax(sorted_logits, dim=-1)
-                cum = torch.cumsum(probs, dim=-1)
-
-                mask = cum > pval
-                mask[..., 0] = False
-                sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
-                logits = torch.zeros_like(logits).scatter(1, sorted_idx, sorted_logits)
-
-            probs = torch.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
-        else:
-            next_id = torch.argmax(logits_raw, dim=-1, keepdim=True)
-
+        next_id = _sample_next_token(logits_raw, do_sample, temperature, top_p)
         full_ids = torch.cat([full_ids, next_id], dim=1)
         attention_mask = torch.cat([attention_mask, torch.ones_like(next_id)], dim=1)
-
         if eos_id is not None and int(next_id.item()) == int(eos_id):
             break
 
@@ -2543,39 +2697,24 @@ def decode_with_band_capture(
         )
         past = out.past_key_values
 
-        # Capture KV telemetry directly from the returned cache.
         if past is not None:
             tracer._capture_kv_drift(past)
-
         tracer.compute_attention_features()
         tracer.finalize_step_stats()
 
         # Capture per-token band telemetry.
-        step = tracer.get_step_band_z(ranges)
-
-        def _finite_or_zero(x: float) -> float:
-            x = float(x)
-            return x if math.isfinite(x) else 0.0
-
-        ze = _finite_or_zero(step["z_early"])
-        zm = _finite_or_zero(step["z_mid"])
-        zl = _finite_or_zero(step["z_late"])
-
-        if _t == 0:
+        ze, zm, zl = _extract_band_z(tracer, ranges)
+        is_warmstart_step = (_t == 0)
+        if is_warmstart_step:
             if max(ze, zm, zl) > 50.0:
                 warmstart_outlier_observed = True
             if not skip_warmstart:
-                zE.append(ze)
-                zM.append(zm)
-                zL.append(zl)
+                zE.append(ze); zM.append(zm); zL.append(zl)
         else:
-            zE.append(ze)
-            zM.append(zm)
-            zL.append(zl)
+            zE.append(ze); zM.append(zm); zL.append(zl)
 
-        # Store raw mid+late activity for drift probe diagnostics.
-        raw = _finite_or_zero(zm + zl)
-        raw = max(min(raw, 60.0), -60.0)
+        # Store clamped mid+late activity for drift probe diagnostics.
+        raw = max(min(_finite_or_zero(zm + zl), 60.0), -60.0)
         probe.drift_hist.append(raw)
 
         if probe.entropy_collapse():
@@ -2583,23 +2722,165 @@ def decode_with_band_capture(
         else:
             probe.collapse_count = 0
 
-    telemetry_bands = {
-        "generated_token_count": len(zE),
-        "z_early": zE,
-        "z_mid": zM,
-        "z_late": zL,
-        "ranges": ranges,
-        "z_mode": getattr(tracer, "band_z_mode", "unknown"),
-        "skip_warmstart": bool(skip_warmstart),
-        "warmstart_outlier_observed": bool(warmstart_outlier_observed),
-        "max_new_tokens": int(max_new_tokens),
-        "do_sample": bool(do_sample),
-        "temperature": float(temperature) if temperature is not None else None,
-        "top_p": float(top_p) if top_p is not None else None,
-    }
-
+    telemetry_bands = _build_telemetry(
+        zE, zM, zL, ranges, tracer, skip_warmstart, warmstart_outlier_observed,
+        max_new_tokens, do_sample, temperature, top_p,
+    )
     return full_ids[0], telemetry_bands
 
+EPS = 1e-9
+
+
+def _seed_everything(seed: int | None) -> None:
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _determine_num_layers(model, hidden_states) -> int:
+    num_layers = int(
+        getattr(model.config, "num_hidden_layers", 0)
+        or getattr(model.config, "n_layer", 0)
+        or 0
+    )
+    if num_layers <= 0 and hidden_states is not None:
+        num_layers = max(0, len(hidden_states) - 1)
+    if num_layers <= 0:
+        raise RuntimeError("Cannot determine num_layers for banding")
+    return num_layers
+
+
+def _mean(values) -> float:
+    """Safe arithmetic mean returning 0.0 for empty sequences."""
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def _safe_quantile(flat: torch.Tensor, q: float) -> float:
+    try:
+        return float(torch.quantile(flat, q).item())
+    except Exception:
+        k = max(1, int(math.ceil(q * flat.numel())))
+        return float(flat.kthvalue(k).values.item())
+
+
+def _compute_moe_metrics(tracer, moe_gate_snapshot, gen_params):
+    """Returns (per_layer_routing_entropy, per_layer_top_expert_ids) and updates gen_params."""
+    moe_decode_trace = getattr(tracer, "moe_decode_trace", None) or {}
+
+    if moe_decode_trace:
+        per_layer_entropy, per_layer_top_ids = [], []
+        for layer_idx in sorted(moe_decode_trace.keys()):
+            layer_trace = moe_decode_trace[layer_idx]
+            entropies = layer_trace.get("entropy", []) or []
+            top1_ids = layer_trace.get("top1", []) or []
+            per_layer_entropy.append(float(statistics.fmean(entropies)) if entropies else 0.0)
+            per_layer_top_ids.append([int(x) for x in top1_ids])
+        gen_params["moe_trace_source"] = "decode"
+        gen_params["moe_decode_steps"] = int(
+            max((len(v.get("entropy", []) or []) for v in moe_decode_trace.values()), default=0)
+        )
+        return per_layer_entropy, per_layer_top_ids
+
+    if moe_gate_snapshot:
+        per_layer_entropy, per_layer_top_ids = [], []
+        for layer_idx in sorted(moe_gate_snapshot.keys()):
+            moe_data = moe_gate_snapshot[layer_idx]
+            probs = moe_data["gates"].view(-1, moe_data["gates"].size(-1))
+            probs_clamped = probs.clamp(min=EPS)
+            entropy = (-probs_clamped * probs_clamped.log()).sum(dim=-1)
+            per_layer_entropy.append(float(entropy.mean().item()))
+            top1_indices = moe_data["indices"][..., 0]
+            per_layer_top_ids.append(top1_indices.view(-1).tolist())
+        gen_params["moe_trace_source"] = "prompt"
+        gen_params["moe_decode_steps"] = 0
+        return per_layer_entropy, per_layer_top_ids
+
+    gen_params["moe_trace_source"] = None
+    gen_params["moe_decode_steps"] = 0
+    return None, None
+
+
+def _compute_layer_delta_stats(hidden_states_all):
+    """Compute per-layer delta statistics (RMS and abs variants)."""
+    stats = {
+        "mean_abs": [], "mean_rms": [],
+        "median_abs": [], "median_rms": [],
+        "p95_abs": [], "p95_rms": [],
+        "tail_abs": [], "tail_rms": [],
+    }
+
+    for layer_idx in range(1, len(hidden_states_all)):
+        diff = hidden_states_all[layer_idx] - hidden_states_all[layer_idx - 1]
+        token_deltas_abs = torch.norm(diff, dim=-1)
+        d_model = int(diff.shape[-1]) if diff.dim() > 0 else 1
+        denom = float(max(1, d_model)) ** 0.5
+        token_deltas_rms = token_deltas_abs / denom
+
+        flat_abs = token_deltas_abs.reshape(-1).float()
+        flat_rms = token_deltas_rms.reshape(-1).float()
+
+        mean_abs = float(flat_abs.mean().item())
+        mean_rms = float(flat_rms.mean().item())
+        p95_abs = _safe_quantile(flat_abs, 0.95)
+        p95_rms = _safe_quantile(flat_rms, 0.95)
+
+        stats["mean_abs"].append(mean_abs)
+        stats["mean_rms"].append(mean_rms)
+        stats["median_abs"].append(float(flat_abs.median().item()))
+        stats["median_rms"].append(float(flat_rms.median().item()))
+        stats["p95_abs"].append(p95_abs)
+        stats["p95_rms"].append(p95_rms)
+        stats["tail_abs"].append(float(mean_abs / (p95_abs + EPS)))
+        stats["tail_rms"].append(float(mean_rms / (p95_rms + EPS)))
+
+    return stats
+
+
+def _compute_spike_diagnostics(core_vals, num_layers, mean_deltas_per_layer):
+    """Returns (spike_layer_idx, spike_ratio, excluded_layers)."""
+    excluded = (
+        {num_layers - 1}
+        if num_layers > 0 and len(mean_deltas_per_layer) > 1
+        else set()
+    )
+    if not core_vals:
+        return None, None, excluded
+
+    median_val = float(torch.tensor(core_vals).median().item())
+    max_val = float(max(core_vals))
+    spike_layer_idx = int(core_vals.index(max_val))
+    spike_ratio = (max_val / (median_val + EPS)) if median_val > 0 else None
+    return spike_layer_idx, spike_ratio, excluded
+
+
+def _compute_head_conflict_stats(attentions, num_hidden_layers):
+    """Returns (per_layer, mean, max) for attention head conflict."""
+    if not USE_ATTENTIONS or attentions is None:
+        per_layer = [0.0] * num_hidden_layers
+        return per_layer, 0.0, 0.0
+
+    per_layer = compute_head_conflict(attentions)
+    mean_hc = _mean(per_layer)
+    max_hc = float(max(per_layer)) if per_layer else 0.0
+    return per_layer, mean_hc, max_hc
+
+
+def _compute_logit_entropy_stats(logits_tensor):
+    """Returns (mean_entropy, final_token_entropy)."""
+    logits = logits_tensor.detach().cpu()
+    entropies = [logit_entropy(logits[0, t, :]) for t in range(logits.shape[1])]
+    mean_ent = _mean(entropies)
+    final_ent = float(entropies[-1]) if entropies else 0.0
+    return mean_ent, final_ent
+
+
+def _aggregate_summary_stats(core_vals):
+    """Returns (mean, max) of the core layer-delta values."""
+    if not core_vals:
+        return 0.0, 0.0
+    return _mean(core_vals), float(max(core_vals))
 
 
 @torch.no_grad()
@@ -2619,57 +2900,37 @@ def compute_tension_for_prompt(
         seed: int | None = None,
 ):
     """Main entry point: run a prompt and return full TensionMetrics (with KV telemetry)."""
+    # Setup tracer
     tracer.clear()
-    tracer.reset_attention_features()  # Now also resets KV buffers
+    tracer.reset_attention_features()
     tracer.register(layer_stride=LAYER_STRIDE)
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    _seed_everything(seed)
 
-    # ---- Seed ----
-    if seed is not None:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+    # Initial forward pass
+    outputs = model(
+        **inputs,
+        output_hidden_states=True,
+        output_attentions=USE_ATTENTIONS,
+        return_dict=True,
+        use_cache=True,
+    )
 
-    # ---- Initial forward pass (for hidden states + initial KV) ----
-    with torch.no_grad():
-        outputs = model(
-            **inputs,
-            output_hidden_states=True,
-            output_attentions=USE_ATTENTIONS,
-            return_dict=True,
-            use_cache=True,
-        )
-
-    # Snapshot MoE gates
     moe_gate_snapshot = dict(tracer.moe_gate_trace) if tracer.moe_gate_trace else {}
     num_experts = tracer.moe_num_experts
-
-    # Determine num_layers
-    num_layers = int(
-        getattr(model.config, "num_hidden_layers", 0)
-        or getattr(model.config, "n_layer", 0)
-        or 0
-    )
-    if num_layers <= 0 and outputs.hidden_states is not None:
-        num_layers = max(0, len(outputs.hidden_states) - 1)
-    if num_layers <= 0:
-        raise RuntimeError("Cannot determine num_layers for banding")
-
+    print("moe_num_experts:", num_experts)
+    num_layers = _determine_num_layers(model, outputs.hidden_states)
+    print("num_layers:", num_layers)
     ranges = _band_ranges(num_layers)
 
-    # ---- Decode with per-token band + KV capture ----
+    # Decode with per-token band + KV capture
     tracer.capture_mode = "step"
     tracer.moe_step_stats = {}
-
-    # tracer._ensure_buffers()
     tracer.step_layer_scalar = [None] * tracer.num_layers_total
 
     full_ids, telemetry_bands = decode_with_band_capture(
-        model,
-        tokenizer,
-        tracer,
-        inputs,
+        model, tokenizer, tracer, inputs,
         ranges=ranges,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
@@ -2680,6 +2941,7 @@ def compute_tension_for_prompt(
     prompt_len = inputs["input_ids"].shape[1]
     response_ids = full_ids[prompt_len:]
     response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+    gen_tokens = int(len(response_ids))
 
     gen_params = {
         "experiment_id": experiment_id,
@@ -2692,191 +2954,64 @@ def compute_tension_for_prompt(
         "pad_token_id": tokenizer.eos_token_id,
     }
 
-    gen_tokens = int(len(response_ids))
-
-    # ---- Hidden states hygiene ----
+    # Hidden states hygiene
     hs_all = list(outputs.hidden_states)
     if num_layers > 0 and len(hs_all) == (num_layers + 2):
         hs_all = hs_all[: (num_layers + 1)]
+    hidden_layers = list(hs_all[1:])
 
-    hidden_layers = list(hs_all[1:])  # block outputs only
-
-    # ---- MoE routing metrics ----
-    per_layer_moe_routing_entropy = None
-    per_layer_moe_top_expert_ids = None
-
-    moe_decode_trace = getattr(tracer, "moe_decode_trace", None) or {}
-
-    if moe_decode_trace:
-        per_layer_moe_routing_entropy = []
-        per_layer_moe_top_expert_ids = []
-
-        for layer_idx in sorted(moe_decode_trace.keys()):
-            layer_trace = moe_decode_trace[layer_idx]
-            entropies = layer_trace.get("entropy", []) or []
-            top1_ids = layer_trace.get("top1", []) or []
-
-            if entropies:
-                per_layer_moe_routing_entropy.append(float(statistics.fmean(entropies)))
-            else:
-                per_layer_moe_routing_entropy.append(0.0)
-
-            per_layer_moe_top_expert_ids.append([int(x) for x in top1_ids])
-
-        gen_params["moe_trace_source"] = "decode"
-        gen_params["moe_decode_steps"] = int(
-            max((len(v.get("entropy", []) or []) for v in moe_decode_trace.values()), default=0)
-        )
-
-    elif moe_gate_snapshot:
-        per_layer_moe_routing_entropy = []
-        per_layer_moe_top_expert_ids = []
-
-        for layer_idx in sorted(moe_gate_snapshot.keys()):
-            moe_data = moe_gate_snapshot[layer_idx]
-            gates = moe_data["gates"]
-            indices = moe_data["indices"]
-
-            probs = gates.view(-1, gates.size(-1))
-            probs_clamped = probs.clamp(min=1e-9)
-            H = (-probs_clamped * probs_clamped.log()).sum(dim=-1)
-            per_layer_moe_routing_entropy.append(float(H.mean().item()))
-
-            top1_indices = indices[..., 0]
-            per_layer_moe_top_expert_ids.append(top1_indices.view(-1).tolist())
-
-        gen_params["moe_trace_source"] = "prompt"
-        gen_params["moe_decode_steps"] = 0
-    else:
-        gen_params["moe_trace_source"] = None
-        gen_params["moe_decode_steps"] = 0
+    # MoE routing metrics
+    per_layer_moe_routing_entropy, per_layer_moe_top_expert_ids = _compute_moe_metrics(
+        tracer, moe_gate_snapshot, gen_params
+    )
 
     tracer.remove()
 
-    # ====================== Delta computations (unchanged) ======================
-    mean_deltas_per_layer_rms = []
-    mean_deltas_per_layer_abs = []
-    median_deltas_per_layer_rms = []
-    median_deltas_per_layer_abs = []
-    p95_deltas_per_layer_rms = []
-    p95_deltas_per_layer_abs = []
-    tail_ratios_per_layer_rms = []
-    tail_ratios_per_layer_abs = []
+    # Delta computations
+    delta_stats = _compute_layer_delta_stats(hs_all)
+    mean_deltas_per_layer = delta_stats["mean_rms"]  # primary series
 
-    hs_for_deltas = hs_all
-    eps = 1e-9
-    for L in range(1, len(hs_for_deltas)):
-        h_prev = hs_for_deltas[L - 1]
-        h_cur = hs_for_deltas[L]
-        diff = h_cur - h_prev
+    gen_params["per_layer_mean_delta_abs"] = delta_stats["mean_abs"]
+    gen_params["per_layer_median_delta_abs"] = delta_stats["median_abs"]
+    gen_params["per_layer_p95_delta_abs"] = delta_stats["p95_abs"]
+    gen_params["per_layer_tail_ratio_abs"] = delta_stats["tail_abs"]
+    gen_params["per_layer_median_delta"] = delta_stats["median_rms"]
+    gen_params["per_layer_p95_delta"] = delta_stats["p95_rms"]
+    gen_params["per_layer_tail_ratio"] = delta_stats["tail_rms"]
 
-        token_deltas_abs = torch.norm(diff, dim=-1)
-        d_model = int(diff.shape[-1]) if diff is not None and diff.dim() > 0 else 1
-        denom = float(max(1, d_model)) ** 0.5
-        token_deltas_rms = token_deltas_abs / denom
+    # Core summary statistics (exclude final layer when possible)
+    core_vals = (
+        mean_deltas_per_layer[:-1] if len(mean_deltas_per_layer) > 1
+        else mean_deltas_per_layer[:]
+    )
+    mean_layer_delta, max_layer_delta = _aggregate_summary_stats(core_vals)
 
-        flat_abs = token_deltas_abs.reshape(-1).float()
-        flat_rms = token_deltas_rms.reshape(-1).float()
-
-        mean_abs = float(flat_abs.mean().item())
-        mean_rms = float(flat_rms.mean().item())
-        med_abs = float(flat_abs.median().item())
-        med_rms = float(flat_rms.median().item())
-
-        try:
-            p95_abs = float(torch.quantile(flat_abs, 0.95).item())
-            p95_rms = float(torch.quantile(flat_rms, 0.95).item())
-        except Exception:
-            import math as _math
-
-            k_abs = max(1, int(_math.ceil(0.95 * flat_abs.numel())))
-            k_rms = max(1, int(_math.ceil(0.95 * flat_rms.numel())))
-            p95_abs = float(flat_abs.kthvalue(k_abs).values.item())
-            p95_rms = float(flat_rms.kthvalue(k_rms).values.item())
-
-        mean_deltas_per_layer_abs.append(mean_abs)
-        mean_deltas_per_layer_rms.append(mean_rms)
-        median_deltas_per_layer_abs.append(med_abs)
-        median_deltas_per_layer_rms.append(med_rms)
-        p95_deltas_per_layer_abs.append(p95_abs)
-        p95_deltas_per_layer_rms.append(p95_rms)
-
-        tail_ratios_per_layer_abs.append(float(mean_abs / (p95_abs + eps)))
-        tail_ratios_per_layer_rms.append(float(mean_rms / (p95_rms + eps)))
-
-    mean_deltas_per_layer = mean_deltas_per_layer_rms  # your primary series
-
-    # Store raw stats in gen_params (unchanged)
-    gen_params["per_layer_mean_delta_abs"] = mean_deltas_per_layer_abs
-    gen_params["per_layer_median_delta_abs"] = median_deltas_per_layer_abs
-    gen_params["per_layer_p95_delta_abs"] = p95_deltas_per_layer_abs
-    gen_params["per_layer_tail_ratio_abs"] = tail_ratios_per_layer_abs
-
-    gen_params["per_layer_median_delta"] = median_deltas_per_layer_rms
-    gen_params["per_layer_p95_delta"] = p95_deltas_per_layer_rms
-    gen_params["per_layer_tail_ratio"] = tail_ratios_per_layer_rms
-
-    # Exclude final layer from core summary statistics when possible.
-    core_vals = mean_deltas_per_layer[:-1] if len(mean_deltas_per_layer) > 1 else mean_deltas_per_layer[:]
-
-    if core_vals:
-        mean_layer_delta = float(sum(core_vals) / len(core_vals))
-        max_layer_delta = float(max(core_vals))
-    else:
-        mean_layer_delta = 0.0
-        max_layer_delta = 0.0
-
-    # Spike ratio also computed on core layers only
-    EXCLUDE_SPIKE_LAYERS = {num_layers - 1} if num_layers > 0 and len(mean_deltas_per_layer) > 1 else set()
-    spike_layer_idx = None
-    spike_ratio = None
-
-    if core_vals:
-        med = float(torch.tensor(core_vals).median().item())
-        mx = float(max(core_vals))
-        spike_layer_idx = int(core_vals.index(mx))
-        spike_ratio = (mx / (med + 1e-9)) if med > 0 else None
-
+    # Spike diagnostics
+    spike_layer_idx, spike_ratio, excluded_layers = _compute_spike_diagnostics(
+        core_vals, num_layers, mean_deltas_per_layer
+    )
     gen_params["delta_spike_transition_idx"] = spike_layer_idx
     gen_params["delta_spike_ratio_vs_median"] = (
         float(spike_ratio) if spike_ratio is not None else None
     )
-    gen_params["delta_spike_excluded_layers"] = sorted(list(EXCLUDE_SPIKE_LAYERS))
-
-    # Extra: max delta excluding known tail spike (already handled by core_vals)
+    gen_params["delta_spike_excluded_layers"] = sorted(list(excluded_layers))
     gen_params["max_layer_delta_ex_tail"] = float(max_layer_delta)
 
-    # ====================== Curvature, Head Conflict, Entropy (unchanged) ======================
+    # Curvature
     curvature_per_layer = compute_curvature_from_hidden(hidden_layers)
     curv_vals = [float(x) for x in curvature_per_layer if x is not None]
-    # ... existing curvature / head_conflict / logit_entropy code ...
-
-    mean_curvature = float(sum(curv_vals) / len(curv_vals)) if curv_vals else 0.0
+    mean_curvature = _mean(curv_vals)
     max_curvature = float(max(curv_vals)) if curv_vals else 0.0
 
-    attentions = outputs.attentions
-    if not USE_ATTENTIONS or attentions is None:
-        head_conflict_per_layer = [0.0] * len(hidden_layers)
-        mean_head_conflict = 0.0
-        max_head_conflict = 0.0
-    else:
-        head_conflict_per_layer = compute_head_conflict(attentions)
-        mean_head_conflict = (
-            float(sum(head_conflict_per_layer) / len(head_conflict_per_layer))
-            if head_conflict_per_layer
-            else 0.0
-        )
-        max_head_conflict = (
-            float(max(head_conflict_per_layer)) if head_conflict_per_layer else 0.0
-        )
+    # Head conflict
+    head_conflict_per_layer, mean_head_conflict, max_head_conflict = (
+        _compute_head_conflict_stats(outputs.attentions, len(hidden_layers))
+    )
 
-    logits = outputs.logits.detach().cpu()
-    entropies = [logit_entropy(logits[0, t, :]) for t in range(logits.shape[1])]
+    # Logit entropy
+    mean_logit_entropy, final_token_entropy = _compute_logit_entropy_stats(outputs.logits)
 
-    mean_logit_entropy = float(sum(entropies) / len(entropies)) if entropies else 0.0
-    final_token_entropy = float(entropies[-1]) if entropies else 0.0
-
-    # ====================== Build TensionMetrics ======================
+    # Build TensionMetrics
     m = TensionMetrics(
         prompt=prompt,
         label=label,
@@ -2898,18 +3033,12 @@ def compute_tension_for_prompt(
         per_layer_moe_top_expert_ids=per_layer_moe_top_expert_ids,
         num_experts=num_experts,
         moe_step_stats=dict(getattr(tracer, "moe_step_stats", {}) or {}),
-
-        # === NEW: KV Cache Telemetry ===
         kv_norm_drift_history=getattr(tracer, "kv_norm_drift_history", [])[:],
         kv_coherence_history=getattr(tracer, "kv_coherence_history", [])[:],
         kv_mean_norm_history=getattr(tracer, "kv_mean_norm_history", [])[:],
     )
 
-    # Existing band series
-    if 'telemetry_bands' in locals():
-        m.telemetry_bands_series = telemetry_bands
-
-    # Copy attention features (you already had these)
+    m.telemetry_bands_series = telemetry_bands
     m.attention_entropy_per_layer = getattr(tracer, "attention_entropy_per_layer", [])[:]
     m.attention_drift_history = getattr(tracer, "attention_drift_history", [])[:]
     m.kv_reuse_scores = getattr(tracer, "kv_reuse_scores", [])[:]
@@ -2920,11 +3049,7 @@ def compute_tension_for_prompt(
 
     return m
 
-
-# -----------------------------
 #  Experiment prompts
-# -----------------------------
-
 CLASS_A_PROMPTS = [
     "What is the capital of France?",
     "What is the chemical symbol for sodium?",
@@ -3031,9 +3156,7 @@ def main():
     if not NOESIS_EXPERIMENT_ID:
         NOESIS_EXPERIMENT_ID = None
 
-    # -------------------------------
     # 0) Resolve prompt pack
-    # -------------------------------
     trace_dir = os.environ.get("NOESIS_TRACE_DIR", "traces")
     os.makedirs(trace_dir, exist_ok=True)
 
@@ -3074,29 +3197,46 @@ def main():
     if MAX_CLASS_B is not None:
         class_b_prompts = class_b_prompts[:MAX_CLASS_B]
 
-    # -------------------------------
     # 1) Load model + tracer
-    # -------------------------------
     print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(NOESIS_MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
         NOESIS_MODEL_NAME,
         attn_implementation="eager",
         torch_dtype="auto",
-        device_map="auto" if DEVICE == "cuda" else None,
+        device_map="cuda"
     )
+
+    # Make sure attention is eager for attentions
+    if USE_ATTENTIONS:
+        try:
+            model.set_attn_implementation("eager")
+            print(
+                "Attention mode set to 'eager' (required for reliable output_attentions=True)"
+            )
+        except Exception as e:
+            print(f"Warning: Could not set attn_implementation to 'eager': {e}")
 
     tracer = TensionTracer(model)
     tracer.register(layer_stride=LAYER_STRIDE)
 
-#    all_metrics = []
     tracer.enable_moe_tracing(top_k=2)
+    print(tracer._moe_patched, tracer.moe_num_experts)
+
+#    if tracer.moe_num_experts is None:
+#        tracer.moe_num_experts = 64
 
     all_metrics: List[TensionMetrics] = []
 
-    # -------------------------------
+    print(f"[MoE] patched={tracer._moe_patched} num_experts={tracer.moe_num_experts}")
+    # Inspect what we actually hooked:
+    for idx, layer in enumerate(tracer._get_layers()):
+        mlp = getattr(layer, "mlp", None)
+        print(f"  layer {idx}: mlp={type(mlp).__name__ if mlp else None} has_gate={hasattr(mlp, 'gate')}")
+        if idx >= 2:
+            break
+
     # 2) Run prompts + immediate trace saving
-    # -------------------------------
     runspec = [
         ("class_a", class_a_prompts, "CLASS_A", False),
         ("class_b", class_b_prompts, "CLASS_B", True),
@@ -3119,9 +3259,13 @@ def main():
                 max_new_tokens=NOESIS_MAX_NEW_TOKENS,
                 seed=NOESIS_SEED,
             )
+
             all_metrics.append(m)
 
-            # === IMMEDIATE TRACE (first pass - no full HTI yet) ===
+            print(f"[MoE] after forward: num_experts={tracer.moe_num_experts} "
+                  f"layers_traced={len(tracer.moe_decode_trace)}")
+
+            # first pass
             notes = f"{label}_prompt_{idx:02d} :: prompt_pack={prompt_pack_name}"
             trace = build_trace_from_metrics(
                 metrics=m,
@@ -3131,7 +3275,7 @@ def main():
                 label=label,
                 run_id=None,
                 notes=notes,
-                hti_stats_v2=None,           # first pass - no calibration yet
+                hti_stats_v2=None,
                 regime_baseline=None,
             )
 
@@ -3147,9 +3291,7 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
-    # -------------------------------
     # 3) HTI v0.2 calibration (after all prompts)
-    # -------------------------------
     stats_v2 = compute_hti_calibration_v2(all_metrics)
 
     def _mu_sigma(xs: List[float]) -> tuple[float, float]:
@@ -3180,9 +3322,7 @@ def main():
         h = compute_hti_v2_for_metric(m, stats_v2)
         print(f"[{m.label.upper()}] tension={h['tension_index']:.3f}  drift/HTI={h['drift_index']:.3f}")
 
-    # -------------------------------
     # 4) Second pass: rebuild traces with full stats
-    # -------------------------------
     print("\nRebuilding traces with full HTI / regime stats...")
     label_counts = {"class_a": 0, "class_b": 0}
 

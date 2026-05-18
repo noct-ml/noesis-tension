@@ -2,48 +2,69 @@
 
 **Telemetry-driven taxonomy of prompt-induced representational pressures in large language models.**
 
-### Change Log — 2026/05/07
+## Resource Usage & Model Format Notes
 
-```text
-telemetry-v0.3.2
+> **Note**: This project can be quite resource-intensive, especially when tracing Mixture-of-Experts (MoE) variants.
 
-- Added KV cache telemetry:
-  - norm drift history
-  - rolling coherence history
-  - mean norm history
-  - final/max drift summaries
+GGUF is not used here. It is equivalent to a **stripped binary** — it lacks the rich metadata needed for proper telemetry and observability work.  
 
-- Updated cognitive regime inference:
-  - classifies with HTI + Noesis profile + KV stability/instability
-  - uses final KV drift, recent drift, coherence, and norm trend
-  - improves symbolic_repetitive_drift, safety_procedural, and liminal_drift separation
+Safetensors is used instead because it provides better introspection and compatibility with telemetry pipelines.
 
-- Cleaned decode loop:
-  - removed micro-shock intervention references from decode_with_band_capture
-  - kept per-token entropy/confidence/margin and band telemetry
-  - captures KV drift directly from returned past_key_values
+## Change Log
 
-- Improved MoE telemetry:
-  - added decode-time MoE routing trace
-  - canonical MoE metrics now prefer generated-response routing
-  - prompt-forward MoE snapshot remains fallback
+This project follows [semantic versioning](https://semver.org/).  
+Notable changes are documented below (newest first).
 
-- Trace output expanded:
-  - extras.kv_cache added
-  - summary KV fields added
-  - regime feature bundles now include KV diagnostics
-  - gen_params records MoE trace source and decode step count
+### v0.3.3 — 2026-05-13
 
-- Fixed:
-  - spike ratio now read from metrics.gen_params
-  - removed fragile KV cache block hook path
-  - prevented prompt-forward-only MoE routing from being treated as response routing
-```
+**refactor(trace):** decompose `build_trace_from_metrics` and remove `hti_v2` alias
 
+Two focused cleanups in the trace-builder module:
 
-### **v0.3.2** (May 2026) — Update Three
+#### 1. Decompose `build_trace_from_metrics`
 
-→ [v0.3.2/](v0.3.2/) (Clean A/B prompt classes, telemetry-only classifier)
+The function had grown to ~280 lines and was mixing many concerns: model introspection, run ID generation, tokenization, HTI computation, KV aggregation, layer construction, band telemetry, MoE summarization, and trace assembly.
+
+Extracted each phase into focused module-level helpers:
+- `_build_model_info`, `_generate_run_id`, `_build_run_info`, `_build_tokens_info`
+- `_compute_hti`, `_find_max_delta_index`
+- `_build_kv_features`, `_resolve_num_layers`, `_build_layer_extra`, `_build_layers`
+- `_attach_band_series`
+- `_resolve_num_experts`, `_build_moe_summary`, `_build_moe_extras`
+- `_band_for_layer`, `_safe_indexed`
+
+Additional cleanups:
+- Eliminated duplicate MoE summary construction (`compute_moe_anomaly` was being called twice with slightly different inlining).
+- Removed shadowing nested helpers that duplicated module-level `_band_ranges` and `_mean`.
+- Hoisted `gen_params = metrics.gen_params or {}` once instead of repeating the pattern 13+ times.
+- Renamed obscure locals (`ts`, `ph`, `enc`, `ly`, `bl`, `bname`) to readable names.
+- Collapsed the `if/else` for `archetype_name` into a conditional expression.
+
+Result: main function reduced from ~280 lines → ~120 lines.
+
+#### 2. Remove redundant `hti_v2` alias
+
+`compute_hti_v2_for_metric` was returning `hti_v2` as a literal alias of `drift_index`. This caused `summary["hti_v0_2"]` to duplicate `summary["drift_index_v0_2"]`.
+
+A project-wide search confirmed no consumers read either key. Removed from:
+- the return dict
+- the `_compute_hti` fallback
+- the trace summary
+
+**Impact**: No behavioral changes except the removal of the two redundant keys from emitted trace JSON.
+
+---
+
+### v0.3.2 — 2026-05-07
+
+- Added KV cache telemetry (norm drift history, rolling coherence history, mean norm history, final/max drift summaries)
+- Updated cognitive regime inference to use HTI + Noesis profile + KV stability/instability signals
+- Cleaned decode loop and improved direct KV drift capture from `past_key_values`
+- Improved MoE telemetry (decode-time routing now preferred over prompt-forward snapshot)
+- Expanded trace output with `extras.kv_cache`, summary KV fields, and regime KV diagnostics
+- Fixed spike ratio source and removed fragile KV cache block hook path
+
+---
 
 ### Requirements
 
@@ -59,44 +80,18 @@ huggingface-cli login
 ```
 
 ```Bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install transformers accelerate bitsandbytes
-pip install jq   # optional, used by the flagging script
+git clone https://github.com/noct-ml/noesis-tension.git
+cd noesis-tension
+python3 -m venv venv
+source venv/bin/activate
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install numpy diffusers accelerate transformers hf_transfer huggingface_hub jq
 ```
 
-Key Features (v3.0)
-
-- Simplified prompt classes: class_a (factual/control) and class_b (mixed/creative/edge cases)
-- Telemetry-only classifier — no string-based prompt/response analysis
-- Core regimes:
-	safety_procedural
-	symbolic_repetitive_drift
-	confident_hallucination_lite
-- Conservative HIGH_TENSION flagging (`tension >= 0.67` + significant spike)
-
-### Known Limitations / Edge Cases
-
-- Some creative prompts (especially short rap, story, or poetic requests) can be classified as symbolic_repetitive_drift even when the output is relatively mundane or formulaic. This is a known soft spot in v3.0 and will be refined in future versions.
-- Llama-3.1-8B tends to show higher tension values than Mistral-7B on procedural/safety-type prompts, leading to more HIGH_TENSION flags.
-
-These behaviors are consistent and do not affect the overall validity of the taxonomy for the preprint.
-
-Repository Structure
-
-```text
-noesis-tension/
-├── v3.0-stable/          ← Stable release (recommended)
-│   ├── noesis_current.py
-│   ├── prompts/
-│   ├── README.md
-│   └── traces/ (examples)
-├── develop/              ← Experimental work
-├── paper/                ← Preprint LaTeX source
-└── README.md             ← This file
-```
+---
 
 ### How to Run
-
 
 ```Bash
 export NOESIS_MODEL="meta-llama/Llama-3.1-8B-Instruct"
@@ -107,24 +102,23 @@ python noesis_current.py
 
 See mistral_35b.sh and llama_test.sh for full example scripts with different models and settings.
 
-
 Traces are saved to ./traces/ and a summary JSON to ./metrics/tension_results.json.
 
+### Repository Structure
 
-### Citation
-
-
-```bibtex
-@misc{jones2026noesis,
-  title={Noesis Tension: A Telemetry-Driven Taxonomy of Prompt-Induced Representational Pressures in Large Language Models},
-  author={James Benjamin Jones},
-  year={2026},
-  doi={10.5281/zenodo.19457642}
-}
+```text
+noesis-tension/
+├── noesis_current.py     ← Current implementation
+├── prompts/              ← Sample prompts
+├── README.md             ← This file
+├── traces/               ← Trace outputs
+├── traces/               ← Metrics
+├── develop/              ← Future versioning
 ```
 
 ### Acknowledgments
 
 Special thanks to the reverse engineering community and former colleagues (especially those from the Fyyre era) who helped shape the low-level thinking behind Noesis Tension.
+
 
 
