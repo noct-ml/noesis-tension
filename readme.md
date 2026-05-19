@@ -15,6 +15,22 @@ Safetensors is used instead because it provides better introspection and compati
 This project follows [semantic versioning](https://semver.org/).  
 Notable changes are documented below (newest first).
 
+### v0.3.4 — 2026-05-19
+
+**Refactor MoE tracing and bump version to 0.3.4**
+
+Bump Noesis and classifier versions/timestamps to 0.3.4 and update schema version used in traces.
+
+Refactor TensionTracer MoE tracing: remember enable_moe_tracing across register() resets. Switch from monkey-patching forward() to register_forward_hook on gate submodules,
+and add robust MoE block discovery (attribute fallbacks and class-name heuristics).
+
+Improve handling of gate outputs (tuples, dims), safer stats accumulation, add error diagnostics/logging and config-based fallback for num_experts.
+Minor cleanup of hooks management and debug prints.
+
+MoE tracing: working!
+
+---
+
 ### v0.3.3 — 2026-05-13
 
 **refactor(trace):** decompose `build_trace_from_metrics` and remove `hti_v2` alias
