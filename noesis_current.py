@@ -1,7 +1,7 @@
 """
-- Noesis Tension Classifier — v0.3.3
+- Noesis Tension Classifier — v0.3.4
 - Author: James (noct-ml)
-- Last Update: 2026/05/18 — 23:14 UTC
+- Last Update: 2026/05/19 — 22:00 UTC
 """
 
 import os
@@ -25,7 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 #  Config
 # -----------------------------
 
-NOESIS_VERSION = "0.3.3"
+NOESIS_VERSION = "0.3.4"
 
 NOESIS_BASELINE_ID = os.environ.get("NOESIS_BASELINE_ID")
 
@@ -103,7 +103,7 @@ def safe_fmean(data, default: float = 0.0) -> float:
 # -----------------------------
 
 # Increment when telemetry-only classification logic changes in a way that affects comparability.
-CLASSIFIER_VERSION = "telemetry-v0.3.3"
+CLASSIFIER_VERSION = "telemetry-v0.3.4"
 
 # Optional baseline pack path (set via env var). If not present, MoE ED baseline is disabled.
 NOESIS_BASELINE_PATH = os.environ.get(
@@ -771,7 +771,6 @@ class TensionTracer:
             self.hooked_layer_indices.append(i)
 
             if USE_ATTENTIONS:
-                # Mistral uses .self_attn, some models use .attn
                 attn_module = None
                 if hasattr(block, "self_attn"):
                     attn_module = block.self_attn
@@ -782,12 +781,11 @@ class TensionTracer:
                     h_attn = attn_module.register_forward_hook(self._hook_attention(i))
                     self._hooks.append(h_attn)
 
-            # KV telemetry is captured explicitly from out.past_key_values
-            # inside decode_with_band_capture(). Do not hook block outputs here,
-            # because most block outputs do not expose full past_key_values and
-            # architectures that do may cause duplicate KV samples.
-
         self.hidden_by_layer = []
+
+        # MoE hooks were wiped by remove(); re-attach them if previously requested.
+        if getattr(self, "_moe_tracing_requested", False):
+            self.enable_moe_tracing(top_k=self.moe_top_k)
 
     def remove(self):
         for h in self._hooks:
@@ -973,8 +971,11 @@ class TensionTracer:
 
     def enable_moe_tracing(self, top_k: int = 2):
         """
-        Patch MoE blocks (if present) to capture gate logits and selected experts.
+        Hook MoE gate submodules to capture routing logits / experts.
+        Safe to call multiple times (idempotent within a single register() lifetime).
         """
+        self._moe_tracing_requested = True  # remember intent across register() resets
+
         if self._moe_patched:
             return
 
@@ -983,122 +984,132 @@ class TensionTracer:
         self.moe_decode_trace = {}
 
         def patch_moe_gate(moe_block, layer_index: int):
-            original_forward = moe_block.forward
+            gate_module = getattr(moe_block, "gate", None)
+            if gate_module is None:
+                return False
 
-            def hacked_forward(block_self, *args, **kwargs):
-                hidden_states = args[0]
-
+            def gate_post_hook(module, inputs, output):
                 try:
-                    gate_logits = block_self.gate(hidden_states)
+                    # One-shot diagnostic the first time any gate hook fires.
+#                    if not hasattr(self, "_moe_gate_introspected"):
+#                        self._moe_gate_introspected = True
+#                        print(f"[MoE diag] gate module class = {type(module).__name__}")
+#                        print(f"[MoE diag] output type = {type(output).__name__}")
+#                        if isinstance(output, (tuple, list)):
+#                            for i, item in enumerate(output):
+#                                print(f"  [{i}] type={type(item).__name__} "
+#                                      f"shape={getattr(item, 'shape', None)}")
 
-                    if (
-                            self.moe_gate_bias_strength
-                            and self.moe_gate_bias_strength > 0.0
-                    ):
-                        # Bias away from an overly-stable top expert streak for the last token position.
-                        # We only touch the final token to keep it localized.
-                        with torch.no_grad():
-                            gl_last = (
-                                gate_logits[:, -1, :]
-                                if gate_logits.dim() == 3
-                                else gate_logits
-                            )
-                            top1 = int(torch.argmax(gl_last.mean(dim=0), dim=-1).item())
-                            last = self._moe_top1_last.get(layer_index)
-                            if last == top1:
-                                self._moe_top1_streak[layer_index] = (
-                                        self._moe_top1_streak.get(layer_index, 1) + 1
-                                )
-                            else:
-                                self._moe_top1_streak[layer_index] = 1
-                            self._moe_top1_last[layer_index] = top1
-
-                            if self._moe_top1_streak[layer_index] >= 3:
-                                bias = float(self.moe_gate_bias_strength)
-                                if gate_logits.dim() == 3:
-                                    gate_logits[:, -1, top1] = gate_logits[:, -1, top1] - bias
-                                else:
-                                    gate_logits[:, top1] = gate_logits[:, top1] - bias
-
-                    # --- per-token routing stats + decode-time aggregate trace ---
-                    try:
-                        with torch.no_grad():
-                            gl_last = (
-                                gate_logits[:, -1, :]
-                                if gate_logits.dim() == 3
-                                else gate_logits
-                            )  # [B, E]
-
-                            p = F.softmax(gl_last.float(), dim=-1)
-                            p_mean = p.mean(dim=0)
-
-                            entropy = float(
-                                -(p_mean * p_mean.clamp(min=1e-9).log()).sum().item()
-                            )
-                            top1 = int(torch.argmax(p_mean, dim=-1).item())
-                            top1_prob = float(p_mean[top1].item())
-
-                            if self._moe_step_acc is not None:
-                                self._moe_step_acc["n"] += 1
-                                self._moe_step_acc["entropy_sum"] += entropy
-                                self._moe_step_acc["top1_prob_sum"] += top1_prob
-                                c = self._moe_step_acc["top1_counts"]
-                                c[top1] = c.get(top1, 0) + 1
-
-                                layer_trace = self.moe_decode_trace.setdefault(
-                                    int(layer_index),
-                                    {
-                                        "entropy": [],
-                                        "top1": [],
-                                        "top1_prob": [],
-                                        "step": [],
-                                    },
-                                )
-                                layer_trace["entropy"].append(float(entropy))
-                                layer_trace["top1"].append(int(top1))
-                                layer_trace["top1_prob"].append(float(top1_prob))
-                                layer_trace["step"].append(int(self._decode_step))
-                    except Exception:
-                        pass
+                    gate_logits = output
+                    # Some MoE gate modules return a tuple, e.g. (logits, aux_loss).
+                    if isinstance(gate_logits, (tuple, list)):
+                        gate_logits = gate_logits[0]
+                    if not hasattr(gate_logits, "dim"):
+                        return
 
                     if self.moe_num_experts is None:
-                        self.moe_num_experts = gate_logits.size(-1)
+                        self.moe_num_experts = int(gate_logits.size(-1))
+                        print(f"[MoE] ✓ num_experts discovered = {self.moe_num_experts} (layer {layer_index})")
 
-                    top_scores, top_indices = gate_logits.topk(self.moe_top_k, dim=-1)
-                    gates = F.softmax(top_scores, dim=-1)
+                    with torch.no_grad():
+                        if gate_logits.dim() == 3:
+                            gl_last = gate_logits[:, -1, :]
+                        elif gate_logits.dim() == 2:
+                            gl_last = gate_logits
+                        else:
+                            return
 
-                    # Last forward snapshot. Useful for prompt-pass debugging, but decode aggregate
-                    # should be preferred for generated-response MoE metrics.
-                    self.moe_gate_trace[layer_index] = {
-                        "gates": gates.detach().cpu(),
-                        "indices": top_indices.detach().cpu(),
-                    }
+                        p = F.softmax(gl_last.float(), dim=-1)
+                        p_mean = p.mean(dim=0)
+                        entropy = float(-(p_mean * p_mean.clamp(min=1e-9).log()).sum().item())
+                        top1 = int(torch.argmax(p_mean, dim=-1).item())
+                        top1_prob = float(p_mean[top1].item())
 
-                except Exception:
-                    pass
+                        if self._moe_step_acc is not None:
+                            self._moe_step_acc["n"] += 1
+                            self._moe_step_acc["entropy_sum"] += entropy
+                            self._moe_step_acc["top1_prob_sum"] += top1_prob
+                            c = self._moe_step_acc["top1_counts"]
+                            c[top1] = c.get(top1, 0) + 1
 
-                return original_forward(*args, **kwargs)
+                            layer_trace = self.moe_decode_trace.setdefault(
+                                int(layer_index),
+                                {"entropy": [], "top1": [], "top1_prob": [], "step": []},
+                            )
+                            layer_trace["entropy"].append(float(entropy))
+                            layer_trace["top1"].append(int(top1))
+                            layer_trace["top1_prob"].append(float(top1_prob))
+                            layer_trace["step"].append(int(self._decode_step))
 
-            moe_block.forward = types.MethodType(hacked_forward, moe_block)
+                        top_scores, top_indices = gate_logits.topk(self.moe_top_k, dim=-1)
+                        gates = F.softmax(top_scores, dim=-1)
+                        self.moe_gate_trace[layer_index] = {
+                            "gates": gates.detach().cpu(),
+                            "indices": top_indices.detach().cpu(),
+                        }
+                except Exception as e:
+                    print(f"[MoE] ✗ gate hook FAILED layer={layer_index}: {type(e).__name__}: {e}")
+
+            h = gate_module.register_forward_hook(gate_post_hook)
+            self._hooks.append(h)
+            return True
 
         layers = self._get_layers()
 
+        moe_found = False
         for idx, layer in enumerate(layers):
             moe_block = None
+            moe_name = None
 
             if hasattr(layer, "block_sparse_moe"):
                 moe_block = layer.block_sparse_moe
-            elif hasattr(layer, "moe") and hasattr(layer.moe, "gate"):
+                moe_name = "block_sparse_moe"
+            elif hasattr(layer, "moe") and hasattr(getattr(layer, "moe", None), "gate"):
                 moe_block = layer.moe
-            elif hasattr(layer, "mlp") and hasattr(layer.mlp, "gate"):
+                moe_name = "moe"
+            elif hasattr(layer, "mlp") and hasattr(getattr(layer, "mlp", None), "gate"):
                 moe_block = layer.mlp
-            elif hasattr(layer, "ffn") and hasattr(layer.ffn, "gate"):
+                moe_name = "mlp"
+            elif hasattr(layer, "ffn") and hasattr(getattr(layer, "ffn", None), "gate"):
                 moe_block = layer.ffn
+                moe_name = "ffn"
 
-            if moe_block is not None:
-                patch_moe_gate(moe_block, idx)
+            # Class-name fallback for Qwen1.5-MoE etc.
+            if moe_block is None:
+                for attr_name in ["mlp", "block_sparse_moe", "moe", "ffn", "sparse_moe", "moe_block"]:
+                    if hasattr(layer, attr_name):
+                        candidate = getattr(layer, attr_name)
+                        if candidate is not None:
+                            cname = type(candidate).__name__.lower()
+                            if any(x in cname for x in ["moe", "sparse", "mixture", "expert", "qwen2moe"]):
+                                if hasattr(candidate, "gate") or hasattr(candidate, "router"):
+                                    moe_block = candidate
+                                    moe_name = f"{attr_name} (class:{type(candidate).__name__})"
+                                    break
+
+            if moe_block is None:
+                continue
+
+            if patch_moe_gate(moe_block, idx):
+                moe_found = True
+#               print(f"[MoE]: Patched layer {idx} via {moe_name}.gate")
 
         self._moe_patched = True
+
+        # Config fallback
+        if self.moe_num_experts is None:
+            cfg = getattr(self.model, "config", None)
+            if cfg is not None:
+                for key in ["num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts"]:
+                    if hasattr(cfg, key):
+                        val = getattr(cfg, key)
+                        if isinstance(val, int) and val > 0:
+                            self.moe_num_experts = val
+                            print(f"[MoE]: Fallback num_experts = {val} from config.{key}")
+                            break
+
+        if not moe_found:
+            print("[MoE]: No MoE blocks detected!")
 
 
 def compute_moe_anomaly(
@@ -1496,6 +1507,9 @@ def _build_moe_summary(
         drift_index=drift_val,
         baseline_moe_stats=get_baseline_moe_stats(),
     )
+
+#    print(f"MoE Experts: {num_experts=}")
+
     return {
         "mean_routing_entropy": moe_mean,
         "max_routing_entropy": moe_max,
@@ -1510,7 +1524,9 @@ def _build_moe_extras(
     tension_val: Optional[float],
     drift_val: Optional[float],
 ) -> Optional[Dict[str, Any]]:
+
     moe_entropies = metrics.per_layer_moe_routing_entropy
+#   print(f"MoE Entropies: {moe_entropies=}")
     if moe_entropies is None:
         return None
 
@@ -1679,8 +1695,8 @@ def build_trace_from_metrics(
         extras["moe"] = moe_extras
 
     return Trace(
-        schema_version="0.3.3",
-        noesis_version="0.3.3",
+        schema_version="0.3.4",
+        noesis_version="0.3.4",
         model=model_info,
         run=run_info,
         tokens=tokens_info,
@@ -3221,10 +3237,12 @@ def main():
     tracer.register(layer_stride=LAYER_STRIDE)
 
     tracer.enable_moe_tracing(top_k=2)
-    print(tracer._moe_patched, tracer.moe_num_experts)
+#    print(f"[diag] model class: {type(model).__name__}")
+#    print(f"[diag] config model_type: {getattr(model.config, 'model_type', None)}")
+#    print(f"[diag] moe_patched={tracer._moe_patched} num_experts={tracer.moe_num_experts}")
+#    print(f"[diag] hooked layers w/ MoE: {len(tracer.moe_gate_trace)}")
 
-#    if tracer.moe_num_experts is None:
-#        tracer.moe_num_experts = 64
+    #print(tracer._moe_patched, tracer.moe_num_experts)
 
     all_metrics: List[TensionMetrics] = []
 
