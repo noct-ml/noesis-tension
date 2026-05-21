@@ -1,7 +1,7 @@
 """
 - Noesis Tension Classifier — v0.3.4
 - Author: James (noct-ml)
-- Last Update: 2026/05/19 — 22:00 UTC
+- Last Update: 2026/05/20 — 21:45 UTC
 """
 
 import os
@@ -1485,11 +1485,247 @@ def _resolve_num_experts(metrics: TensionMetrics, model) -> Optional[int]:
     return num_experts
 
 
-def _build_moe_summary(
+
+def _compute_moe_telemetry(
     metrics: TensionMetrics,
-    model,
-    tension_val: Optional[float],
-    drift_val: Optional[float],
+    moe_entropies: List[float],
+    num_experts: Optional[int],
+    anomaly_components: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute extended MoE telemetry from per-layer routing data.
+
+    Produces five groups of derived metrics:
+      1) routing_entropy_by_band  : early/mid/late aggregates (U-shape detection)
+      2) commitment               : layer-of-min-entropy ("decisiveness layer")
+      3) expert_utilization       : pool-wide expert usage stats (Gini, used count, etc.)
+      4) temporal                 : per-decode-step entropy time-series and slope
+      5) anomaly_dominance        : which component drives the anomaly score
+    """
+    out: Dict[str, Any] = {}
+
+    if not moe_entropies:
+        return out
+
+    n_layers = len(moe_entropies)
+
+    # ---------------------------------------------------------------
+    # (1) Routing entropy by band (early / mid / late)
+    # ---------------------------------------------------------------
+    ranges = _band_ranges(n_layers)
+    by_band: Dict[str, Dict[str, float]] = {}
+    for band in ("early", "mid", "late"):
+        lo, hi = ranges[band]
+        seg = moe_entropies[lo : hi + 1]
+        if seg:
+            by_band[band] = {
+                "mean": float(statistics.fmean(seg)),
+                "max": float(max(seg)),
+                "min": float(min(seg)),
+            }
+        else:
+            by_band[band] = {"mean": 0.0, "max": 0.0, "min": 0.0}
+    out["routing_entropy_by_band"] = by_band
+
+    # U-shape index: (early+late)/2 - mid_min
+    # Positive => U-shape (mid commits, ends diversify)
+    # Negative => inverted-U (mid diversifies, ends commit)
+    u_index = (by_band["early"]["mean"] + by_band["late"]["mean"]) / 2.0 - by_band["mid"]["min"]
+    out["entropy_u_index"] = float(u_index)
+
+    if u_index > 0.10:
+        shape = "u_shape"
+    elif u_index < -0.10:
+        shape = "inverted_u"
+    else:
+        # check monotonicity for flat vs trending
+        if by_band["late"]["mean"] < by_band["early"]["mean"] - 0.10:
+            shape = "monotonic_decrease"
+        elif by_band["late"]["mean"] > by_band["early"]["mean"] + 0.10:
+            shape = "monotonic_increase"
+        else:
+            shape = "flat"
+    out["entropy_shape"] = shape
+
+    # Simple linear slope across all layers (least-squares, no numpy)
+    if n_layers >= 2:
+        x_mean = (n_layers - 1) / 2.0
+        y_mean = statistics.fmean(moe_entropies)
+        num = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(moe_entropies))
+        den = sum((i - x_mean) ** 2 for i in range(n_layers)) or 1.0
+        out["entropy_slope"] = float(num / den)
+    else:
+        out["entropy_slope"] = 0.0
+
+    # ---------------------------------------------------------------
+    # (2) Commitment layer (argmin of per-layer routing entropy)
+    # ---------------------------------------------------------------
+    commit_idx = int(min(range(n_layers), key=lambda i: moe_entropies[i]))
+    out["commitment"] = {
+        "layer_idx": commit_idx,
+        "entropy": float(moe_entropies[commit_idx]),
+        "band": _band_for_layer(commit_idx, n_layers),
+        "rel_position": float(commit_idx) / float(max(1, n_layers - 1)),
+    }
+
+    # ---------------------------------------------------------------
+    # (3) Expert utilization (pool-wide)
+    # ---------------------------------------------------------------
+    top_ids_by_layer = metrics.per_layer_moe_top_expert_ids or []
+    expert_counts: Dict[int, int] = {}
+    for layer_ids in top_ids_by_layer:
+        if not layer_ids:
+            continue
+        for eid in layer_ids:
+            expert_counts[int(eid)] = expert_counts.get(int(eid), 0) + 1
+
+    total_routes = sum(expert_counts.values())
+    util: Dict[str, Any] = {
+        "experts_used": int(len(expert_counts)),
+        "experts_total": int(num_experts) if num_experts else None,
+        "total_routes": int(total_routes),
+    }
+
+    if num_experts and num_experts > 0:
+        util["utilization_ratio"] = float(len(expert_counts)) / float(num_experts)
+    else:
+        util["utilization_ratio"] = 0.0
+
+    if total_routes > 0 and expert_counts:
+        # Probability mass per expert
+        probs = sorted(
+            [c / total_routes for c in expert_counts.values()],
+            reverse=True,
+        )
+
+        # Gini coefficient over expert usage
+        # G = (sum_{i,j} |x_i - x_j|) / (2 * n * sum(x_i)) ; using sorted-formula:
+        # G = (2 * sum(i*x_i) / (n * sum(x))) - (n + 1) / n
+        # where x is sorted ascending and i in [1..n]
+        asc = sorted(expert_counts.values())
+        n = len(asc)
+        cum = sum((i + 1) * v for i, v in enumerate(asc))
+        s = sum(asc)
+        gini = (2.0 * cum) / (n * s) - (n + 1.0) / n if s > 0 and n > 0 else 0.0
+        util["gini"] = float(max(0.0, min(1.0, gini)))
+
+        # Top-K share (top 5 experts' fraction of all routes)
+        top_k = min(5, len(probs))
+        util["top5_share"] = float(sum(probs[:top_k]))
+
+        # Entropy over expert usage histogram
+        H = -sum(p * math.log(p + 1e-12) for p in probs if p > 0)
+        util["usage_entropy"] = float(H)
+        if num_experts and num_experts > 1:
+            util["normalized_usage_entropy"] = float(H / math.log(num_experts))
+        else:
+            util["normalized_usage_entropy"] = 0.0
+    else:
+        util["gini"] = 0.0
+        util["top5_share"] = 0.0
+        util["usage_entropy"] = 0.0
+        util["normalized_usage_entropy"] = 0.0
+
+    out["expert_utilization"] = util
+
+    # ---------------------------------------------------------------
+    # (4) Temporal: per-decode-step routing entropy time-series
+    # ---------------------------------------------------------------
+    # moe_step_stats: {step_idx: {"routing_entropy_mean": float, ...}, ...}
+    step_stats = getattr(metrics, "moe_step_stats", None) or {}
+    if step_stats:
+        steps_sorted = sorted(int(k) for k in step_stats.keys())
+        ent_series = [
+            float(step_stats[s].get("routing_entropy_mean", 0.0)) for s in steps_sorted
+        ]
+        top1_prob_series = [
+            float(step_stats[s].get("routing_top1_prob_mean", 0.0)) for s in steps_sorted
+        ]
+        mode_frac_series = [
+            float(step_stats[s].get("routing_top1_mode_frac", 0.0)) for s in steps_sorted
+        ]
+
+        temporal: Dict[str, Any] = {
+            "step_count": len(ent_series),
+            "routing_entropy_per_step": ent_series,
+            "top1_prob_per_step": top1_prob_series,
+            "mode_frac_per_step": mode_frac_series,
+        }
+
+        if len(ent_series) >= 2:
+            xm = (len(ent_series) - 1) / 2.0
+            ym = statistics.fmean(ent_series)
+            num = sum((i - xm) * (y - ym) for i, y in enumerate(ent_series))
+            den = sum((i - xm) ** 2 for i in range(len(ent_series))) or 1.0
+            slope = num / den
+
+            temporal["routing_entropy_step_slope"] = float(slope)
+            temporal["routing_entropy_step_mean"] = float(ym)
+            temporal["routing_entropy_step_var"] = (
+                float(statistics.pvariance(ent_series)) if len(ent_series) > 1 else 0.0
+            )
+
+            if slope < -0.005:
+                trend = "decreasing"   # locking in
+            elif slope > 0.005:
+                trend = "increasing"   # losing the thread
+            else:
+                trend = "flat"
+            temporal["routing_entropy_step_trend"] = trend
+        else:
+            temporal["routing_entropy_step_slope"] = 0.0
+            temporal["routing_entropy_step_mean"] = (
+                float(ent_series[0]) if ent_series else 0.0
+            )
+            temporal["routing_entropy_step_var"] = 0.0
+            temporal["routing_entropy_step_trend"] = "flat"
+
+        out["temporal"] = temporal
+
+    # ---------------------------------------------------------------
+    # (5) Anomaly component dominance
+    # ---------------------------------------------------------------
+    if anomaly_components:
+        # Weights mirror those in compute_moe_anomaly()
+        weights = {"rsa": 0.40, "efs": 0.25, "ed": 0.10, "rv": 0.10, "dti": 0.15}
+        weighted = {
+            k: float(weights.get(k, 0.0)) * float(anomaly_components.get(k, 0.0))
+            for k in weights
+        }
+        total_w = sum(weighted.values())
+
+        if total_w > 1e-12:
+            shares = {k: v / total_w for k, v in weighted.items()}
+            dominant_component = max(shares.items(), key=lambda kv: kv[1])
+            # Entropy over component shares (low = single driver, high = diffuse)
+            comp_H = -sum(s * math.log(s + 1e-12) for s in shares.values() if s > 0)
+            comp_H_max = math.log(len(shares)) if len(shares) > 1 else 1.0
+            out["anomaly_dominance"] = {
+                "dominant_component": dominant_component[0],
+                "dominant_share": float(dominant_component[1]),
+                "shares": {k: float(v) for k, v in shares.items()},
+                "component_entropy": float(comp_H),
+                "normalized_component_entropy": float(comp_H / comp_H_max)
+                if comp_H_max > 0
+                else 0.0,
+            }
+        else:
+            out["anomaly_dominance"] = {
+                "dominant_component": None,
+                "dominant_share": 0.0,
+                "shares": {k: 0.0 for k in weights},
+                "component_entropy": 0.0,
+                "normalized_component_entropy": 0.0,
+            }
+
+    return out
+
+
+def _build_moe_summary(
+        metrics: TensionMetrics,
+        model,
+        tension_val: Optional[float],
+        drift_val: Optional[float],
 ) -> Optional[Dict[str, Any]]:
     moe_entropies = metrics.per_layer_moe_routing_entropy
     if moe_entropies is None:
@@ -1497,6 +1733,7 @@ def _build_moe_summary(
 
     moe_mean = float(sum(moe_entropies) / len(moe_entropies)) if moe_entropies else None
     moe_max = float(max(moe_entropies)) if moe_entropies else None
+    moe_min = float(min(moe_entropies)) if moe_entropies else None
     num_experts = _resolve_num_experts(metrics, model)
 
     moe_anom = compute_moe_anomaly(
@@ -1508,14 +1745,26 @@ def _build_moe_summary(
         baseline_moe_stats=get_baseline_moe_stats(),
     )
 
-#    print(f"MoE Experts: {num_experts=}")
+    # Extended MoE telemetry (commitment layer, band stats, expert utilization,
+    # per-step time-series, anomaly component dominance).
+    telemetry = _compute_moe_telemetry(
+        metrics=metrics,
+        moe_entropies=moe_entropies,
+        num_experts=num_experts,
+        anomaly_components=(moe_anom.get("components") if moe_anom else None),
+    )
 
-    return {
+    print(f"MoE Experts: {num_experts=}")
+
+    summary: Dict[str, Any] = {
         "mean_routing_entropy": moe_mean,
         "max_routing_entropy": moe_max,
+        "min_routing_entropy": moe_min,
         "num_experts": num_experts,
         "anomaly": moe_anom,
     }
+    summary.update(telemetry)
+    return summary
 
 
 def _build_moe_extras(
@@ -1526,7 +1775,7 @@ def _build_moe_extras(
 ) -> Optional[Dict[str, Any]]:
 
     moe_entropies = metrics.per_layer_moe_routing_entropy
-#   print(f"MoE Entropies: {moe_entropies=}")
+
     if moe_entropies is None:
         return None
 
@@ -1623,7 +1872,7 @@ def build_trace_from_metrics(
     # Attach per-token band series (if present and well-formed)
     _attach_band_series(telemetry_bands, metrics, ranges)
 
-    # -------- Noesis Neuro-Ontological Stress Profile (telemetry-only) ----
+    # Noesis Neuro-Ontological Stress Profile (telemetry-only)
     moe_summary_for_noesis = _build_moe_summary(metrics, model, tension_val, drift_val)
     noesis_profile = telemetry_noesis_profile(
         metrics=metrics,
@@ -1631,7 +1880,7 @@ def build_trace_from_metrics(
         moe_summary=moe_summary_for_noesis,
     )
 
-    # --- Cognitive Regime Classification ---
+    # Cognitive Regime Classification
     regime_info = infer_cognitive_regime(
         metrics=metrics,
         noesis_profile=noesis_profile,
@@ -1641,7 +1890,7 @@ def build_trace_from_metrics(
         regime_baseline=regime_baseline,
     )
 
-    # --- Classification stability (Phase III, telemetry-only) ---
+    # Classification stability (Phase III, telemetry-only)
     regime_info["stability_v0"] = compute_stability_v0(
         metrics=metrics,
         noesis_profile=noesis_profile,
@@ -1871,11 +2120,42 @@ def telemetry_noesis_profile(
     moe_mean_ent = None
     moe_max_ent = None
     moe_anom = None
+    moe_commit_idx = None
+    moe_commit_band = None
+    moe_entropy_shape = None
+    moe_entropy_slope = None
+    moe_u_index = None
+    moe_utilization_ratio = None
+    moe_gini = None
+    moe_step_slope = None
+    moe_step_trend = None
+    moe_dominant_component = None
+    moe_dominant_share = None
     if moe_summary:
         moe_mean_ent = moe_summary.get("mean_routing_entropy", None)
         moe_max_ent = moe_summary.get("max_routing_entropy", None)
         an = moe_summary.get("anomaly", None) or {}
         moe_anom = an.get("score_v0_1", None)
+
+        commit = moe_summary.get("commitment") or {}
+        moe_commit_idx = commit.get("layer_idx")
+        moe_commit_band = commit.get("band")
+
+        moe_entropy_shape = moe_summary.get("entropy_shape")
+        moe_entropy_slope = moe_summary.get("entropy_slope")
+        moe_u_index = moe_summary.get("entropy_u_index")
+
+        util = moe_summary.get("expert_utilization") or {}
+        moe_utilization_ratio = util.get("utilization_ratio")
+        moe_gini = util.get("gini")
+
+        temporal = moe_summary.get("temporal") or {}
+        moe_step_slope = temporal.get("routing_entropy_step_slope")
+        moe_step_trend = temporal.get("routing_entropy_step_trend")
+
+        dom = moe_summary.get("anomaly_dominance") or {}
+        moe_dominant_component = dom.get("dominant_component")
+        moe_dominant_share = dom.get("dominant_share")
 
     # Helper scaling
     def clamp01(x: float) -> float:
@@ -1966,6 +2246,18 @@ def telemetry_noesis_profile(
             "moe_anomaly": moe_anom,
             "moe_mean_entropy": moe_mean_ent,
             "moe_max_entropy": moe_max_ent,
+            # Extended MoE features (v0.3.4)
+            "moe_commitment_layer": moe_commit_idx,
+            "moe_commitment_band": moe_commit_band,
+            "moe_entropy_shape": moe_entropy_shape,
+            "moe_entropy_slope": moe_entropy_slope,
+            "moe_u_index": moe_u_index,
+            "moe_utilization_ratio": moe_utilization_ratio,
+            "moe_gini": moe_gini,
+            "moe_step_entropy_slope": moe_step_slope,
+            "moe_step_entropy_trend": moe_step_trend,
+            "moe_dominant_component": moe_dominant_component,
+            "moe_dominant_share": moe_dominant_share,
         },
     }
 
@@ -3123,7 +3415,8 @@ CLASS_B_PROMPTS = [
 
 def print_active_config() -> None:
     """Quick debug helper to show what configuration is actually active."""
-    print(f"\nNoesis Active Configuration\n")
+    print(f"\nNoesis Tension — https://github.com/noct-ml/noesis-tension\n")
+    print(f"Active Configuration\n")
     print(f" Model           : {NOESIS_MODEL_NAME: <36}")
     print(f" Device          : {DEVICE: <36}")
     print(f" Max new tokens  : {NOESIS_MAX_NEW_TOKENS: <36}")
