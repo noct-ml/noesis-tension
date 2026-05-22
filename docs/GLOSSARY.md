@@ -384,21 +384,36 @@ hash.
 
 ## Alphabetical index
 
-[A] anomaly dominance · anomaly score (MoE) ·
-[B] band · baseline pack ·
-[C] classification margin · classifier version · commitment layer · curvature ·
-[D] delta spike · drift index ·
-[E] entropy shape · expert utilization ·
-[F] final token entropy ·
-[G] Gini (expert) ·
-[H] head conflict · HTI ·
-[K] KV coherence · KV late jump · KV norm drift · KV reuse · KV spiky ·
-[L] layer delta · logit entropy ·
-[M] margin bucket · mean layer delta · MoE anomaly ·
-[N] Noesis category vector ·
-[P] per-token band telemetry · prompt id ·
-[R] regime · routing entropy · run id ·
-[S] safety liminality · schema version ·
-[T] telemetry · tension index · trace ·
-[U] U-index · U-shape ·
-[W] warm-start step
+**A** — [anomaly dominance](#anomaly-dominance) · [anomaly score (MoE)](#moe-anomaly-score)
+
+**B** — [band](#band-early--mid--late) · [baseline pack](#baseline-pack)
+
+**C** — [classification margin](#classification-margin) · [classifier version](#classifier-version) · [commitment layer](#commitment-layer) · [curvature](#curvature)
+
+**D** — [delta spike](#delta-spike) · [drift index](#drift-index)
+
+**E** — [entropy shape](#entropy-shape) · [expert utilization](#expert-utilization)
+
+**F** — [final token entropy](#final-token-entropy)
+
+**G** — [Gini (expert)](#gini-expert)
+
+**H** — [head conflict](#head-conflict) · [HTI](#derived-indices-hti-v02)
+
+**K** — [KV coherence](#kv-coherence) · [KV late jump](#kv-late-jump) · [KV norm drift](#kv-norm-drift) · [KV reuse score](#kv-reuse-score) · [KV spiky](#kv-spiky)
+
+**L** — [layer delta](#layer-delta) · [logit entropy](#logit-entropy)
+
+**M** — [margin bucket](#margin-bucket) · [max layer delta](#max-layer-delta) · [mean layer delta](#mean-layer-delta) · [mean logit entropy](#mean-logit-entropy) · [MoE anomaly score](#moe-anomaly-score)
+
+**P** — [per-token band telemetry](#per-token-band-telemetry)
+
+**R** — [regime labels](#regime-labels) · [regime score](#regime-score) · [routing entropy](#routing-entropy)
+
+**S** — [safety liminality](#safety-liminality) · [sampling vs greedy](#sampling-vs-greedy)
+
+**T** — [telemetry](#telemetry) · [tension index](#tension-index) · [top indices](#top-indices) · [trace](#trace)
+
+**U** — [U-index](#u-index)
+
+**W** — [warm-start step](#warm-start-step)
