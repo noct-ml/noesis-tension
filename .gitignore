@@ -184,3 +184,6 @@ cython_debug/
 /v3.0-stable/traces
 /v3.0-stable/traces
 /v3.0-stable/traces/llama_3_1_8B_final
+noesis_baseline_qwen1.5_moe_a2.7b_20251212.json
+noesis_baseline_qwen1.5_moe_a2.7b_20251212_v2.json
+noesis_baseline_qwen1.5_moe_a2.7b_20251212_v2.json
