@@ -27,8 +27,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 NOESIS_VERSION = "0.3.4"
 
-NOESIS_BASELINE_ID = os.environ.get("NOESIS_BASELINE_ID")
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 NOESIS_MODEL_NAME = os.environ.get(
@@ -104,97 +102,6 @@ def safe_fmean(data, default: float = 0.0) -> float:
 
 # Increment when telemetry-only classification logic changes in a way that affects comparability.
 CLASSIFIER_VERSION = "telemetry-v0.3.4"
-
-# Optional baseline pack path (set via env var). If not present, MoE ED baseline is disabled.
-NOESIS_BASELINE_PATH = os.environ.get(
-    "NOESIS_BASELINE_PATH",
-    "noesis_baseline_qwen1.5_moe_a2.7b_20251212.json",
-)
-
-_BASELINE_PACK: Optional[Dict[str, Any]] = None
-_BASELINE_ID: Optional[str] = None
-
-
-def _load_baseline_pack() -> None:
-    """Load baseline pack once (best-effort)."""
-    global _BASELINE_PACK, _BASELINE_ID
-    if _BASELINE_PACK is not None:
-        return
-
-    try:
-        if not NOESIS_BASELINE_PATH or not os.path.exists(NOESIS_BASELINE_PATH):
-            _BASELINE_PACK = None
-            _BASELINE_ID = None
-            return
-
-        with open(NOESIS_BASELINE_PATH, "r") as f:
-            pack = json.load(f)
-
-        # Stable-ish baseline id: hash of content + optional metadata.
-        blob = json.dumps(pack, sort_keys=True).encode("utf-8")
-        h = hashlib.sha256(blob).hexdigest()[:12]
-        ver = pack.get("baseline_version") or pack.get("version") or "baseline"
-        gen = pack.get("generated_utc") or pack.get("generated") or ""
-        _BASELINE_ID = f"{ver}:{gen}:{h}".strip(":")
-        _BASELINE_PACK = pack
-    except Exception:
-        _BASELINE_PACK = None
-        _BASELINE_ID = None
-
-
-def get_baseline_id() -> Optional[str]:
-    _load_baseline_pack()
-    return _BASELINE_ID
-
-
-def get_baseline_moe_stats() -> Optional[Dict[str, float]]:
-    """
-    Convert our baseline pack into the dict expected by compute_moe_anomaly().
-
-    Expected keys:
-      - mean_entropy_mu
-      - mean_entropy_sigma
-      - layer_entropy_std_ref  (optional)
-    """
-    _load_baseline_pack()
-    if not _BASELINE_PACK:
-        return None
-
-    # Support both the baseline structure produced by compute_regime_baseline_from_traces()
-    # and the compact baseline pack we emit for the service.
-    # compute_regime_baseline_from_traces relocated to create_baselines.py
-    pack = _BASELINE_PACK
-
-    try:
-        # Compact pack shape: pack["scalars"]["moe_mean_routing_entropy"]["mu"/"sigma"]
-        scalars = pack.get("scalars") or {}
-        moe_mean = scalars.get("moe_mean_routing_entropy") or {}
-        mu = moe_mean.get("mu", None)
-        sigma = moe_mean.get("sigma", None)
-
-        # Alternate shape (older): pack["components"]["moe_mean_entropy"]["mean"/"std"]
-        if mu is None or sigma is None:
-            comps = pack.get("components") or {}
-            alt = comps.get("moe_mean_entropy") or {}
-            mu = alt.get("mean", mu)
-            sigma = alt.get("std", sigma)
-
-        if mu is None or sigma is None:
-            return None
-
-        mu = float(mu)
-        sigma = float(sigma)
-        if sigma == 0.0 or math.isnan(sigma) or math.isinf(sigma):
-            sigma = 1.0
-
-        return {
-            "mean_entropy_mu": mu,
-            "mean_entropy_sigma": sigma,
-            "layer_entropy_std_ref": sigma,
-        }
-    except Exception:
-        return None
-
 
 # -----------------------------
 #  Data structures
@@ -1118,7 +1025,6 @@ def compute_moe_anomaly(
     num_experts: Optional[int],
     tension_index: Optional[float] = None,
     drift_index: Optional[float] = None,
-    baseline_moe_stats: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     Compute Noesis MoE Anomaly Score v0.1 for a single trace.
@@ -1133,12 +1039,8 @@ def compute_moe_anomaly(
         - total expert count for this model (e.g., 60 for Qwen1.5-MoE-A2.7B)
       tension_index, drift_index:
         - from HTI v0.2 (tension, drift); can be None
-      baseline_moe_stats (optional):
-        {
-          "mean_entropy_mu": float,
-          "mean_entropy_sigma": float,
-          "layer_entropy_std_ref": float
-        }
+
+    Note: entropy deviation (ed) component is zeroed (requires external baseline).
 
     Returns:
       {
@@ -1146,7 +1048,7 @@ def compute_moe_anomaly(
         "components": {
           "rsa": ...,
           "efs": ...,
-          "ed": ...,
+          "ed": ...,   # always 0.0 (no baseline)
           "rv": ...,
           "dti": ...
         }
@@ -1245,16 +1147,17 @@ def compute_moe_anomaly(
     # -------------------------
     # 3) Entropy deviation (ED) from baseline mean
     # -------------------------
-    if baseline_moe_stats is not None:
-        E_mean = float(sum(moe_entropies) / len(moe_entropies))
-        mu_E = baseline_moe_stats.get("mean_entropy_mu", E_mean)
-        sigma_E = baseline_moe_stats.get("mean_entropy_sigma", 1.0)
-        if sigma_E == 0.0:
-            sigma_E = 1.0
-        z = abs(E_mean - mu_E) / (3.0 * sigma_E)
-        ed = clamp01(z)
-    else:
-        ed = 0.0
+    #if baseline_moe_stats is not None:
+    #    E_mean = float(sum(moe_entropies) / len(moe_entropies))
+    #    mu_E = baseline_moe_stats.get("mean_entropy_mu", E_mean)
+    #    sigma_E = baseline_moe_stats.get("mean_entropy_sigma", 1.0)
+    #    if sigma_E == 0.0:
+    #        sigma_E = 1.0
+    #    z = abs(E_mean - mu_E) / (3.0 * sigma_E)
+    #    ed = clamp01(z)
+    #else:
+    #    ed = 0.0
+    ed = 0.0
 
     # -------------------------
     # 4) Routing variance across layers (RV)
@@ -1279,12 +1182,13 @@ def compute_moe_anomaly(
     # -------------------------
     # 6) Combine into MoE Anomaly v0.1
     # -------------------------
-    w_rsa = 0.40
-    w_efs = 0.25
-    w_ed = 0.10
-    w_rv = 0.10
-    w_dti = 0.15
-
+    # NOTE: ed is permanently 0.0 (requires external baseline, which has been removed).
+    # Its weight (0.10) has been redistributed proportionally across the remaining components.
+    w_rsa = 0.444
+    w_efs = 0.278
+    w_ed = 0.00
+    w_rv = 0.111
+    w_dti = 0.167
     moe_anomaly_raw = w_rsa * rsa + w_efs * efs + w_ed * ed + w_rv * rv + w_dti * dti
     score = clamp01(moe_anomaly_raw)
 
@@ -1344,13 +1248,11 @@ def _build_run_info(
     response_text: Optional[str],
     notes: Optional[str],
     metrics: TensionMetrics,
-    baseline_id: Optional[str],
 ) -> Dict[str, Any]:
     gen_params = metrics.gen_params or {}
     run_info: Dict[str, Any] = {
         "id": run_id,
         "classifier_version": CLASSIFIER_VERSION,
-        "baseline_id": baseline_id,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "label": label,
         "prompt": prompt,
@@ -1687,7 +1589,7 @@ def _compute_moe_telemetry(
     # ---------------------------------------------------------------
     if anomaly_components:
         # Weights mirror those in compute_moe_anomaly()
-        weights = {"rsa": 0.40, "efs": 0.25, "ed": 0.10, "rv": 0.10, "dti": 0.15}
+        weights = {"rsa": 0.444, "efs": 0.278, "ed": 0.0, "rv": 0.111, "dti": 0.167}
         weighted = {
             k: float(weights.get(k, 0.0)) * float(anomaly_components.get(k, 0.0))
             for k in weights
@@ -1742,7 +1644,6 @@ def _build_moe_summary(
         num_experts=num_experts,
         tension_index=tension_val,
         drift_index=drift_val,
-        baseline_moe_stats=get_baseline_moe_stats(),
     )
 
     # Extended MoE telemetry (commitment layer, band stats, expert utilization,
@@ -1753,8 +1654,6 @@ def _build_moe_summary(
         num_experts=num_experts,
         anomaly_components=(moe_anom.get("components") if moe_anom else None),
     )
-
-    print(f"MoE Experts: {num_experts=}")
 
     summary: Dict[str, Any] = {
         "mean_routing_entropy": moe_mean,
@@ -1813,13 +1712,6 @@ def build_trace_from_metrics(
 
     # Determine whether MoE telemetry is present for THIS trace.
     has_moe = metrics.per_layer_moe_routing_entropy is not None
-    resolved_baseline = NOESIS_BASELINE_ID or get_baseline_id()
-    # Commitment-collapse fix: MoE requires baseline_id
-    if has_moe and not resolved_baseline:
-        raise RuntimeError(
-            "MoE telemetry present but baseline_id is missing. "
-            "Refusing to emit trace (prevents invalid baseline-relative analysis)."
-        )
 
     run_info = _build_run_info(
         run_id=run_id,
@@ -1828,7 +1720,6 @@ def build_trace_from_metrics(
         response_text=response_text,
         notes=notes,
         metrics=metrics,
-        baseline_id=(resolved_baseline if has_moe else None),
     )
 
     tokens_info = _build_tokens_info(tokenizer, prompt)
@@ -3227,9 +3118,7 @@ def compute_tension_for_prompt(
 
     moe_gate_snapshot = dict(tracer.moe_gate_trace) if tracer.moe_gate_trace else {}
     num_experts = tracer.moe_num_experts
-    print("moe_num_experts:", num_experts)
     num_layers = _determine_num_layers(model, outputs.hidden_states)
-    print("num_layers:", num_layers)
     ranges = _band_ranges(num_layers)
 
     # Decode with per-token band + KV capture
